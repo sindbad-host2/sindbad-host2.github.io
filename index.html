@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sindbad Host</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  body {
+    margin: 0;
+    padding: 0;
+    min-height: 100vh;
+    background-image: url('hub.jpg'); /* غير الامتداد إلى .png إذا كانت صورتك PNG */
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    color: #ffffff;
+    font-family: Arial, sans-serif;
+    text-align: center;
+  }
+
+  .overlay {
+    min-height: 100vh;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 20px;
+    box-sizing: border-box;
+  }
+
+  #crypto {
+    display: none;
+  }
+</style>
+</head>
+<body>
+<div class="overlay">
+<script>
+  var histlength = history.length;
+  if (histlength > 2) {
+    history.go(-(histlength - 2));
+  }
+</script>
+
+<h1 id="msgs">Sindbad Host</h1>
+<hr>
+<br>
+
+<div id="menu">
+  <h1 style="font-size: 18px; color: yellow;">Select Your Firmware</h1>
+  <button class="btn btn-multi" onmouseover="msgs.innerHTML='Sindbad Host - Multi Firmware Support'" onmouseout="msgs.innerHTML='Sindbad Host'" onclick="location.replace('g2all/index.html')">GoldHEN Multi FW</button>
+  <button class="btn" onmouseover="msgs.innerHTML='Sindbad Host - 5.05 FW v2.5'" onmouseout="msgs.innerHTML='Sindbad Host'" onclick="location.replace('505/index.html')">5.05 FW v2.5</button>
+  <a href="672goldhen/index.html"><button class="btn" onmouseover="msgs.innerHTML='Sindbad Host - 6.72 FW GoldHEN'" onmouseout="msgs.innerHTML='Sindbad Host'">6.72 FW GoldHEN</button></a>
+  <a href="672/index.html"><button class="btn" onmouseover="msgs.innerHTML='Sindbad Host - 6.72 FW v3.0'" onmouseout="msgs.innerHTML='Sindbad Host'">6.72 FW v3.0</button></a>
+  <br>
+  <a href="900goldhen/index.html"><button class="btn" onmouseover="msgs.innerHTML='Sindbad Host - 9.00 FW GoldHEN'" onmouseout="msgs.innerHTML='Sindbad Host'">9.00 FW GoldHEN</button></a>
+  <a href="900v3/index.html"><button class="btn" onmouseover="msgs.innerHTML='Sindbad Host - 9.00 FW v3.0'" onmouseout="msgs.innerHTML='Sindbad Host'">9.00 FW v3.0</button></a>
+  <br>
+  <button class="btn" onmouseover="msgs.innerHTML='Sindbad Host - Restore Host Without DNS'" onmouseout="msgs.innerHTML='Sindbad Host'" onclick="location.replace('restore/index.html')">Restore Host</button>
+  <br>
+  <button class="btn btn-onln" onmouseover="msgs.innerHTML='Support Sindbad Host'" onmouseout="msgs.innerHTML='Sindbad Host'" onclick="donations()" style="margin-top: 137px; margin-bottom: 77px; width: 468px; max-width: 95%;">For Donations (Only in Cryptocurrencies)</button>
+  <h1 style="margin-top: 78px;">Hosted by: <span style="color: #f31414; margin-left: 10px; margin-right: 10px;">Sindbad Host</span> A special thanks to all the devs on the scene.</h1>
+</div>
+
+<div id="crypto">
+  <h1 style="font-size: 18px; color: yellow;">Donate with Bitcoin (BTC):</h1>
+  <img src="btc.jpg" width="150" height="150" alt="BTC">
+  <br>
+  <h1 style="font-size: 18px;">bc1q6cnsykmvem6zgw8wag3ygee0jkhtxj6rkp2nrm</h1>
+  <br>
+  <h1 style="font-size: 18px; color: yellow;">Donate with Ethereum (ETH):</h1>
+  <img src="eth.jpg" width="150" height="150" alt="ETH">
+  <h1 style="font-size: 18px;">0x7Ae1825ddE196925
