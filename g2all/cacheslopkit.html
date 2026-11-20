@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en" manifest="slopkit.manifest">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sindbad-Host | Caching Slopkit</title>
+<link rel="stylesheet" href="../style.css">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100vw;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  body {
+    background-image: url('../img.jpg');
+    background-size: cover;
+    background-position: center center;
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    background-color: #121212;
+    color: #ffffff;
+    font-family: Arial, sans-serif;
+    text-align: center;
+  }
+
+  .overlay {
+    width: 100%;
+    min-height: 100vh;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 20px;
+    box-sizing: border-box;
+  }
+</style>
+</head>
+<body>
+<div class="overlay">
+  <h1>Sindbad-Host</h1>
+  <hr>
+  <h2 id="cacheStatus" style="margin-top: 80px;">Caching Files... Please Wait</h2>
+</div>
+
+<script>
+  var appCache = window.applicationCache;
+
+  function updateStatus(msg) {
+    document.getElementById("cacheStatus").innerHTML = msg;
+  
