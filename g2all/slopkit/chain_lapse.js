@@ -2111,8 +2111,8 @@ function makeRpc(worker) {
                     }
                     check("read-primitive-survives-write", kstr2 === "evf cv",
                         "'" + kstr2 + "' after " + kwriteCalls + " pktinfo writes");
-                    check("ip6po_pktinfo-not-left-interior",
-                    check("ip6po_pktinfo-not-left-interior",
+                
+                    check("ip6po_pktinfo-not-left-interior"
                         kstr2 === "evf cv",
                         "a dangling interior pointer here is a free() of a "
                         + "non-allocation at teardown -- that is what panicked "
