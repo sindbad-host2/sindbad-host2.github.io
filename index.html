@@ -4,12 +4,109 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sindbad-Host</title>
-<meta http-equiv="refresh" content="0; url=g2all/">
-<script>
-  window.location.replace("g2all/");
-</script>
+<link rel="stylesheet" href="style.css">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100vw;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  body {
+    background-image: url('img.jpg');
+    background-size: cover;
+    background-position: center center;
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    background-color: #121212;
+    color: #ffffff;
+    font-family: Arial, sans-serif;
+    text-align: center;
+  }
+
+  .overlay {
+    width: 100%;
+    min-height: 100vh;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 32px 20px;
+    box-sizing: border-box;
+  }
+
+  .header-box h1 {
+    margin: 0;
+    font-size: 36px;
+    letter-spacing: 1px;
+  }
+
+  .prompt-text {
+    margin: 14px 0 28px;
+    font-size: 18px;
+    color: #e0e0e0;
+  }
+
+  .menu-grid {
+    max-width: 720px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .menu-btn {
+    display: block;
+    text-decoration: none;
+    background: rgba(20, 20, 20, 0.85);
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 10px;
+    padding: 16px 20px;
+    font-size: 18px;
+    font-weight: bold;
+    transition: 0.2s ease;
+  }
+
+  .menu-btn:hover,
+  .menu-btn:focus {
+    background: rgba(255, 255, 255, 0.16);
+    border-color: #ffffff;
+    transform: translateY(-2px);
+  }
+
+  .sub-label {
+    display: block;
+    font-size: 13px;
+    font-weight: normal;
+    color: #bbbbbb;
+    margin-top: 4px;
+  }
+</style>
 </head>
-<body style="background:#121212;color:#fff;font-family:Arial,sans-serif;text-align:center;margin-top:80px;">
-  <p>Redirecting to Sindbad-Host...</p>
+<body>
+<div class="overlay">
+  <div class="header-box">
+    <h1>Sindbad-Host</h1>
+    <p class="prompt-text">Choose an option to launch:</p>
+  </div>
+  <hr style="max-width: 720px; opacity: 0.25;">
+
+  <div class="menu-grid">
+    <a class="menu-btn" href="g2all/">
+      G2All Exploit &amp; GoldHEN
+      <span class="sub-label">Open g2all host menu</span>
+    </a>
+
+    <a class="menu-btn" href="g2all/cacheslopkit.html">
+      Slopkit Cache
+      <span class="sub-label">Cache slopkit files</span>
+    </a>
+
+    <a class="menu-btn" href="jb.html">
+      Root WebKit / JB
+      <span class="sub-label">Launch root jb.html</span>
+    </a>
+  </div>
+</div>
 </body>
 </html>
