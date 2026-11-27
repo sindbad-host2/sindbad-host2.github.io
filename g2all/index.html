@@ -38,47 +38,45 @@
     justify-content: center;
   }
 
-  .title-box {
-    background: rgba(15, 23, 42, 0.75);
+  .panel {
+    background: rgba(15, 23, 42, 0.78);
     border: 1px solid rgba(255, 255, 255, 0.25);
     border-radius: 12px;
-    padding: 18px 28px;
-    margin-bottom: 24px;
-    max-width: 650px;
+    padding: 24px 28px;
+    max-width: 680px;
     width: 100%;
     box-sizing: border-box;
   }
 
-  .title-box h1 {
-    margin: 0;
+  h1 {
+    margin: 0 0 12px;
     font-size: 34px;
   }
 
-  #status {
+  #msgs {
     margin: 14px 0 24px;
-    font-size: 20px;
+    font-size: 19px;
     color: #e2e8f0;
+    min-height: 28px;
   }
 
-  .action-btn {
+  .btn {
     background: #1d4ed8;
     color: #ffffff;
     border: 2px solid #60a5fa;
     border-radius: 10px;
-    padding: 16px 34px;
-    font-size: 20px;
+    padding: 15px 30px;
+    font-size: 19px;
     font-weight: bold;
     cursor: pointer;
-    transition: 0.2s ease;
   }
 
-  .action-btn:hover,
-  .action-btn:focus {
+  .btn:hover,
+  .btn:focus {
     background: #2563eb;
-    transform: scale(1.03);
   }
 
-  .action-btn:disabled {
+  .btn:disabled {
     opacity: 0.6;
     cursor: not-allowed;
   }
@@ -86,87 +84,36 @@
 </head>
 <body>
 <div class="overlay">
-  <div class="title-box">
+  <div class="panel">
     <h1>Sindbad-Host</h1>
-    <p id="status">Ready - Press button to load files &amp; GoldHEN</p>
+    <div id="msgs">Press button to start &amp; load GoldHEN</div>
+    <button id="start-btn" class="btn" onclick="triggerExploit()">
+      Load GoldHEN
+    </button>
   </div>
-
-  <button id="goldhen-btn" class="action-btn" onclick="startAndLoadGoldHEN()">
-    Load GoldHEN &amp; Files
-  </button>
 </div>
 
-<div id="scripts-container"></div>
+<script type="module">
+  window.triggerExploit = async function () {
+    const btn = document.getElementById("start-btn");
+    const msgs = document.getElementById("msgs");
+    if (btn) btn.disabled = true;
+    if (msgs) msgs.innerText = "Starting exploit & loading files...";
 
-<script>
-  const slopkitFiles = [
-    "slopkit/int64.js",
-    "slopkit/mem.js",
-    "slopkit/ps4_offsets.js",
-    "slopkit/core.js",
-    "slopkit/rpc_worker.js",
-    "slopkit/jb.js",
-    "slopkit/chain_lapse.js",
-    "slopkit/afterglow.js"
-  ];
-
-  let filesLoaded = false;
-
-  function setStatus(text) {
-    const statusEl = document.getElementById("status");
-    if (statusEl) {
-      statusEl.innerText = text;
-    }
-  }
-
-  function loadScriptSequential(index) {
-    if (index >= slopkitFiles.length) {
-      filesLoaded = true;
-      setStatus("Files loaded. Launching GoldHEN...");
-      triggerGoldHENPayload();
-      return;
-    }
-
-    const src = slopkitFiles[index];
-    setStatus("Loading " + src + " (" + (index + 1) + "/" + slopkitFiles.length + ")...");
-
-    const script = document.createElement("script");
-    script.src = src;
-    script.onload = function () {
-      loadScriptSequential(index + 1);
-    };
-    script.onerror = function () {
-      setStatus("Error loading: " + src);
-      const btn = document.getElementById("goldhen-btn");
+    try {
+      if (typeof window.runLapseExploit === "function") {
+        await window.runLapseExploit();
+      } else {
+        await import("./slopkit/chain_lapse.js");
+      }
+    } catch (err) {
+      if (msgs) {
+        msgs.innerText = "Error: " + (err && err.message ? err.message : String(err));
+        msgs.style.color = "yellow";
+      }
       if (btn) btn.disabled = false;
-    };
-
-    document.getElementById("scripts-container").appendChild(script);
-  }
-
-  function triggerGoldHENPayload() {
-    if (typeof loadPayload === "function") {
-      loadPayload("goldhen_2.4b18.14.bin");
-      setStatus("GoldHEN payload sent: goldhen_2.4b18.14.bin");
-    } else {
-      setStatus("Exploit scripts loaded. Waiting for payload handler...");
     }
-  }
-
-  function startAndLoadGoldHEN() {
-    const btn = document.getElementById("goldhen-btn");
-    if (btn) {
-      btn.disabled = true;
-    }
-
-    if (filesLoaded) {
-      triggerGoldHENPayload();
-      if (btn) btn.disabled = false;
-      return;
-    }
-
-    loadScriptSequential(0);
-  }
+  };
 </script>
 </body>
 </html>
