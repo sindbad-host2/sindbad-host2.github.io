@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sindbad-Host | PS4 [5.05] 7.00 - 14.02 FW</title>
-<link rel="stylesheet" href="../style.css">
+<title>Sindbad-Host</title>
+<link rel="stylesheet" href="style.css">
 <style>
   html, body {
     margin: 0;
@@ -15,7 +15,7 @@
   }
 
   body {
-    background-image: url('../img.jpg'); /* غيرها إلى 'img.jpg' إذا كانت الصورة في نفس المجلد */
+    background-image: url('img.jpg');
     background-size: cover;
     background-position: center center;
     background-repeat: no-repeat;
@@ -30,92 +30,41 @@
     width: 100%;
     min-height: 100vh;
     background: rgba(0, 0, 0, 0.55);
-    padding: 20px;
+    padding: 24px;
     box-sizing: border-box;
   }
 </style>
 </head>
 <body>
 <div class="overlay">
+  <h1>Sindbad-Host</h1>
+  <hr>
+  <h2 id="status" style="margin-top: 40px;">Initializing Exploit...</h2>
+
+  <button id="goldhen-btn" onclick="loadGoldHEN()" style="padding: 12px 24px; font-size: 16px; cursor: pointer; margin-top: 20px;">
+    Load GoldHEN
+  </button>
+</div>
+
+<script src="slopkit/int64.js"></script>
+<script src="slopkit/mem.js"></script>
+<script src="slopkit/ps4_offsets.js"></script>
+<script src="slopkit/core.js"></script>
+<script src="slopkit/rpc_worker.js"></script>
+<script src="slopkit/jb.js"></script>
+<script src="slopkit/chain_lapse.js"></script>
+<script src="slopkit/afterglow.js"></script>
+
 <script>
-var uaFull = navigator.userAgent;
-var match = uaFull.match(/PlayStation 4[ /]([\d.]+)/i);
-var isPS4 = match !== null;
-var fwVersion = isPS4 ? match[1] : "Unknown";
-var fwNum = parseFloat(fwVersion);
-
-function onScriptError() {
-    msgs.innerHTML = "Content not Found! - Clear Browser Data and Re-Install Cache ...";
-}
-
-if (!isPS4) {
-    document.addEventListener("DOMContentLoaded", () => {
-        msgs.innerHTML = "Only for PS4 with Firmware 5.05 and 7.00 to 14.02";
-    });
-} else {
-    if (window.applicationCache.status == '0') {
-        if (fwNum == 5.05 || fwNum == 5.07) {
-            window.location.replace("cache505.html");
-        } else if (fwNum >= 7.00 && fwNum <= 8.52) {
-            window.location.replace("cache700.html");
-        } else if (fwNum >= 9.00 && fwNum <= 9.60) {
-            window.location.replace("cache900.html");
-        } else if (fwNum >= 10.00 && fwNum <= 11.02) {
-            window.location.replace("cachecss.html");
-        } else if (fwNum >= 11.50 && fwNum <= 14.02) {
-            window.location.replace("cacheslopkit.html");
-        } else {
-            document.addEventListener("DOMContentLoaded", () => {
-                msgs.innerHTML = 'Unsupported Firmware: <span style="color: red;">' + fwVersion + '</span>';
-            });
-        }
-    } else {
-        if (fwNum == 5.05 || fwNum == 5.07) {
-            var script = document.createElement('script');
-            script.src = "505/exploit.js";
-            script.onerror = onScriptError;
-            document.head.appendChild(script);
-        }
-        else if (fwNum >= 7.00 && fwNum <= 8.52) {
-            var script = document.createElement('script');
-            script.type = 'module';
-            script.src = "700/alert.js";
-            script.onerror = onScriptError;
-            document.head.appendChild(script);
-        }
-        else if (fwNum >= 9.00 && fwNum <= 9.60) {
-            var script = document.createElement('script');
-            script.type = 'module';
-            script.src = "900/alert.js";
-            script.onerror = onScriptError;
-            document.head.appendChild(script);
-        }
-        else if (fwNum >= 10.00 && fwNum <= 11.02) {
-            var script = document.createElement('script');
-            script.src = "css/main.js";
-            script.onerror = onScriptError;
-            script.onload = function () {
-                setTimeout(function () {
-                    doJb();
-                }, 500);
-            };
-            document.head.appendChild(script);
-        }
-        else if (fwNum == 11.50 || fwNum == 11.52) {
-            var script = document.createElement('script');
-            script.type = 'module';
-            script.src = "slopkit/chain_lapse.js";
-            script.onerror = onScriptError;
-            document.head.appendChild(script);
-        }
-        else if (fwNum >= 12.00 && fwNum <= 14.02) {
-            var script = document.createElement('script');
-            script.type = 'module';
-            script.src = "slopkit/jb.js";
-            script.onerror = onScriptError;
-            document.head.appendChild(script);
-        }
+  function loadGoldHEN() {
+    const statusEl = document.getElementById("status");
+    if (statusEl) {
+      statusEl.innerText = "Loading GoldHEN...";
     }
-}
+    if (typeof loadPayload === "function") {
+      loadPayload("goldhen_2.4b18.14.bin");
+    }
+  }
 </script>
-<h1>
+</body>
+</html>
