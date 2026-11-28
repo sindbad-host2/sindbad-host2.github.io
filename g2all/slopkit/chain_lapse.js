@@ -3703,6 +3703,5 @@ function makeRpc(worker) {
                     : "REPAIRED -- NO REBOOT NEEDED";
                 stateEl.className = "ok";
             } catch (e) { }
-        }
     }
 })();
